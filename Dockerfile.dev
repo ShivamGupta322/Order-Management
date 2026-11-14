@@ -1,0 +1,9 @@
+# Development image: the project is bind-mounted at /app, not copied in.
+FROM erlang:28.4.2
+
+# brod -> kafka_protocol -> crc32cer builds its NIF with cmake.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app

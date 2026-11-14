@@ -137,6 +137,8 @@ Every topic carries the same JSON shape. This is also the shape the Pact contrac
 
 `amount` is an integer in the smallest currency unit (paise), never a float. `attempt` starts at 0 and increases on each retry.
 
+The client sends `id`, `customer_id`, `amount`, `currency`, and `items`. The API sets `attempt` to 0 and `created_at` to the current UTC time, overwriting any client value. Accepted currencies are `INR`, `USD`, `EUR`, and `GBP`. Unknown JSON fields are dropped when the event is decoded.
+
 ### Which store holds what
 
 | Data | Store | Why |
@@ -279,6 +281,8 @@ There is a real gap here to be honest about: a crash after `charge` succeeds but
 
 The whole system starts with `docker-compose up` for infrastructure and `rebar3 shell` for the app.
 
+The app and every `rebar3` command run inside a Linux container (the `app` service), not on the host. `brod` depends on `kafka_protocol`, which depends on the `crc32cer` NIF, and that NIF only builds on Linux and macOS; every maintained Erlang Kafka client has the same kind of native dependency. The project folder is bind-mounted into the container, so files are edited on the host as usual.
+
 ### Folder layout
 
 ```
@@ -287,12 +291,15 @@ order_processing/
 ├── CLAUDE.md
 ├── rebar.config
 ├── docker-compose.yml
+├── Dockerfile.dev     dev image: erlang plus cmake for the crc32cer NIF
 ├── Makefile
 ├── docs/
 │   └── IMPLEMENTATION_GUIDE.md
 ├── config/
 │   ├── sys.config
 │   └── vm.args
+├── include/
+│   └── order_topics.hrl   topic name macros, the one place topics are named
 ├── src/
 │   ├── order_app.erl, order_sup.erl
 │   ├── order_http_handler.erl
@@ -332,11 +339,19 @@ Dependencies without a version take the latest from hex.pm, and `rebar.lock` the
 
 ### docker-compose.yml
 
+Three services, abbreviated here; see `docker-compose.yml` for the full file:
+
 ```yaml
 services:
   kafka:
-    image: apache/kafka:latest   # KRaft mode, no ZooKeeper; pin a version tag
+    image: apache/kafka:3.9.0    # KRaft mode, no ZooKeeper
     ports: ["9092:9092"]
+    environment:
+      # INTERNAL for containers (the app uses kafka:19092),
+      # EXTERNAL for host tools (localhost:9092).
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:9092
+      # ...plus the KRaft settings for a single combined broker and controller
   postgres:
     image: postgres:16
     environment:
@@ -344,7 +359,17 @@ services:
       POSTGRES_PASSWORD: orders
       POSTGRES_DB: orders
     ports: ["5432:5432"]
+  app:
+    build: {context: ., dockerfile: Dockerfile.dev}
+    profiles: ["dev"]            # `docker compose up -d` starts infrastructure only
+    volumes: [".:/app", "app_build:/app/_build", "rebar3_cache:/root/.cache/rebar3"]
+    ports: ["8080:8080"]
+    depends_on: {kafka: {condition: service_healthy}}
 ```
+
+Kafka needs two listeners because a broker tells clients which address to reconnect on. With only `localhost:9092`, a client in the app container would be sent to its own localhost. `_build` lives in a named volume so the Linux build never mixes with a host build.
+
+Run the app with `docker compose run --rm --service-ports app rebar3 shell`, or in the background with `docker compose --profile dev up -d app`. `brod_client` exits at start if no broker is reachable, which is why the app waits for Kafka's health check.
 
 Create each topic once after Kafka is up:
 
@@ -531,6 +556,8 @@ Either way the result is the same: renaming `amount` to `total` on the producer 
 | `rebar3 ct --dir test/pact` | Contract tests |
 | `rebar3 ct --dir test/ct --suite e2e_SUITE` | End-to-end, with Docker Compose running |
 | `rebar3 dialyzer` | Type checks |
+
+Run each command inside the app container: `docker compose run --rm app <command>`.
 
 A GitHub Actions workflow runs everything except the end-to-end suite on every push.
 

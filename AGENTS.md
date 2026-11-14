@@ -52,15 +52,17 @@ A fault-tolerant, event-driven order processing backend in Erlang/OTP and Kafka.
 
 ## Commands
 
+All `rebar3` commands run inside the `app` container (`brod`'s NIF does not build on Windows). Prefix each one with `docker compose run --rm app`.
+
 ```
 docker compose up -d                 # Kafka and PostgreSQL
-./scripts/create_topics.sh           # once, after Kafka is up
-rebar3 compile
-rebar3 shell                         # run the app
-rebar3 eunit --cover                 # unit tests
-rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE
-rebar3 ct --dir test/pact            # contract tests
-rebar3 dialyzer
+./scripts/create_topics.sh           # once, after Kafka is up (Git Bash on Windows)
+docker compose run --rm --service-ports app rebar3 shell   # run the app on :8080
+docker compose run --rm app rebar3 compile
+docker compose run --rm app rebar3 eunit --cover           # unit tests
+docker compose run --rm app rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE
+docker compose run --rm app rebar3 ct --dir test/pact      # contract tests
+docker compose run --rm app rebar3 dialyzer
 ```
 
 ## Boundaries

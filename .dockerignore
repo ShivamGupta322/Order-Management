@@ -1,0 +1,6 @@
+_build/
+Mnesia.*/
+.git/
+.env
+*.crashdump
+erl_crash.dump

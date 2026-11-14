@@ -3,7 +3,7 @@
   {vsn, "0.1.0"},
   {registered, [order_sup]},
   {mod, {order_app, []}},
-  {applications, [kernel, stdlib]},
+  {applications, [kernel, stdlib, jsx, ranch, cowboy, brod]},
   {env, []},
   {modules, []},
   {licenses, []},
