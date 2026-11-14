@@ -149,12 +149,18 @@ The client sends `id`, `customer_id`, `amount`, `currency`, and `items`. The API
 
 ### Mnesia tables
 
+Records live in `include/order_tables.hrl`, the one place tables are named. `processed_order` arrives in phase 6.
+
 ```erlang
 -record(processed_order, {id :: binary(), processed_at :: integer()}).
 -record(order, {id :: binary(),
                 status :: pending | processing | completed | failed,
+                customer_id :: binary(),
                 amount :: non_neg_integer(),
+                currency :: binary(),
+                items :: [map()],
                 attempt = 0 :: non_neg_integer(),
+                created_at :: binary() | undefined,
                 updated_at :: integer()}).
 
 init_tables() ->
@@ -170,6 +176,14 @@ init_tables() ->
 ```
 
 `mnesia:create_schema/1` and `create_table/2` return an error tuple when the schema or table already exists, so match on both outcomes at boot instead of asserting `ok`.
+
+The `order` record holds the full order, not just its status. That way `GET /orders/:id` can return `customer_id`, `currency`, and `items` before PostgreSQL arrives in phase 8.
+
+`order_mnesia:init/0` does this setup. `order_app:start/2` calls it before starting the supervisor. Mnesia is not in the app's `applications` list: starting it before the disc schema exists would give a RAM-only schema.
+
+- **Copy type:** `mnesia_copies` in app env selects it. It is `disc_copies` normally and `ram_copies` in tests, so tests leave no files behind.
+- **Node name:** disc tables are tied to the node name. The app container uses `hostname: app` and `rebar3 shell --sname order_processing`, which gives the node `order_processing@app`.
+- **Data location:** the Mnesia directory is `/var/lib/order_app/mnesia`, on the `mnesia_data` volume, so orders survive container restarts.
 
 ### PostgreSQL schema
 
@@ -249,7 +263,10 @@ next(_) -> dead_letter.
 - The worker never sleeps on a failed order. It publishes the order to `orders.retry` with `attempt + 1` and a `not_before` timestamp, commits, and moves on, so one bad order cannot block a partition.
 - `retry_manager` consumes `orders.retry`, waits until `not_before`, and republishes to `orders`. The simplest correct version handles one message at a time and commits after republishing.
 - Errors are classified. A timeout is retryable. A validation failure or a declined payment is fatal and goes straight to the DLQ.
-- A DLQ message carries the original order plus `reason`, `attempt`, and `failed_at`.
+- A DLQ message carries the original order plus `reason`, `attempt`, and `failed_at`. `reason` is a string such as `"declined"`, `"timeout"`, or `"invalid:amount"`.
+- A message that cannot be decoded has no order to carry. Its DLQ message is `{"raw_base64": ..., "reason": "malformed_json" | "not_an_object", "failed_at": ...}`. The raw bytes are base64-encoded because they may not be valid UTF-8, which JSON strings require. It is keyed by the original Kafka key.
+- Until `retry_manager` exists (phase 5), retryable failures are dead-lettered too, and the simulated gateway's failure rates default to 0.0 in `sys.config`.
+- `consumer_worker` is a `brod_group_subscriber_v2` callback module in consumer group `order_consumers`. brod runs one callback process per assigned partition. It shares the `brod` client started by `order_producer`.
 
 ### Idempotency
 
@@ -494,6 +511,10 @@ wait_until(Fun, Timeout) ->
 ```
 
 `order_test_helper:feed/1` hands an encoded message straight to the worker callback, so these suites run without a broker.
+
+The guide's sample code uses `timer:sleep` (once in the duplicate case, and inside `wait_until/2` as its 50 ms poll interval). The real suites follow `CLAUDE.md`: they poll with `wait_until/2` and never sleep to wait for an outcome.
+
+`order_test_helper:start_app/0` is shared by both suites. It starts `order_app` with Mnesia in RAM and stubs the edges: `order_producer`, `consumer_worker:start_link/0` (everything else in that module passes through to the real code), and `payment_gateway`. `brod_client` exits at init without a reachable broker, which is why its start is stubbed.
 
 ### Common Test: producer suite
 

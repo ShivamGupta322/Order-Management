@@ -57,7 +57,7 @@ All `rebar3` commands run inside the `app` container (`brod`'s NIF does not buil
 ```
 docker compose up -d                 # Kafka and PostgreSQL
 ./scripts/create_topics.sh           # once, after Kafka is up (Git Bash on Windows)
-docker compose run --rm --service-ports app rebar3 shell   # run the app on :8080
+docker compose run --rm --service-ports app rebar3 shell --sname order_processing   # run the app on :8080
 docker compose run --rm app rebar3 compile
 docker compose run --rm app rebar3 eunit --cover           # unit tests
 docker compose run --rm app rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE

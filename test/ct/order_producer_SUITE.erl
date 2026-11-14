@@ -12,33 +12,19 @@ all() ->
      health_returns_200].
 
 init_per_suite(Config) ->
-    %% Port 0 lets the OS pick a free port; read it back from ranch below.
-    ok = application:set_env(order_app, http_port, 0, [{persistent, true}]),
-    {ok, _} = application:ensure_all_started(inets),
-    ok = meck:new(order_producer, [no_link]),
-    %% brod_client needs a reachable broker to start, so the producer edge is
-    %% stubbed with a linked process the supervisor can own and shut down.
-    ok = meck:expect(order_producer, start_link,
-                     fun() -> {ok, proc_lib:spawn_link(fun stub_loop/0)} end),
-    {ok, _} = application:ensure_all_started(order_app),
-    [{base_url, "http://127.0.0.1:" ++ integer_to_list(ranch:get_port(order_http))}
-     | Config].
+    %% Kafka edges are stubbed, so no broker is needed; see order_test_helper.
+    ok = order_test_helper:start_app(),
+    [{base_url, order_test_helper:base_url()} | Config].
 
 end_per_suite(_Config) ->
-    ok = application:stop(order_app),
-    ok = application:unset_env(order_app, http_port, [{persistent, true}]),
-    meck:unload().
+    order_test_helper:stop_app().
 
 init_per_testcase(_Case, Config) ->
-    ok = meck:expect(order_producer, publish, fun(_Topic, _Key, _Value) -> ok end),
-    ok = meck:reset(order_producer),
+    ok = order_test_helper:reset(),
     Config.
 
 end_per_testcase(_Case, _Config) ->
     ok.
-
-stub_loop() ->
-    receive _ -> stub_loop() end.
 
 %%--------------------------------------------------------------------
 

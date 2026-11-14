@@ -36,26 +36,31 @@ services:
 
   # The Erlang app runs in Linux because brod's crc32cer NIF only builds there.
   # In the "dev" profile so `docker compose up -d` starts infrastructure only.
-  # Usage: docker compose run --rm --service-ports app rebar3 shell
+  # Usage: docker compose run --rm --service-ports app rebar3 shell --sname order_processing
   app:
     build:
       context: .
       dockerfile: Dockerfile.dev
     profiles: ["dev"]
+    # Mnesia disc tables are tied to the node name, so the host part
+    # (order_processing@app) must stay the same across container restarts.
+    hostname: app
     working_dir: /app
     volumes:
       - .:/app
       # Keep Linux build output and the hex cache out of the Windows checkout.
       - app_build:/app/_build
       - rebar3_cache:/root/.cache/rebar3
+      - mnesia_data:/var/lib/order_app
     ports: ["8080:8080"]
     depends_on:
       kafka:
         condition: service_healthy
     stdin_open: true
     tty: true
-    command: rebar3 shell
+    command: rebar3 shell --sname order_processing
 
 volumes:
   app_build:
   rebar3_cache:
+  mnesia_data:

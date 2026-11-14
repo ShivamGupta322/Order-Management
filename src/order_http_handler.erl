@@ -9,7 +9,7 @@
 -export([init/2]).
 -export_type([route/0]).
 
--type route() :: orders | health.
+-type route() :: orders | order | health.
 
 -define(DEFAULT_MAX_BODY_BYTES, 65536).
 
@@ -22,6 +22,8 @@ handle(health, <<"GET">>, Req) ->
     reply(200, #{status => ok}, Req);
 handle(orders, <<"POST">>, Req) ->
     create_order(Req);
+handle(order, <<"GET">>, Req) ->
+    show_order(order_store:get(cowboy_req:binding(id, Req)), Req);
 handle(_Route, _Method, Req) ->
     reply(405, #{error => method_not_allowed}, Req).
 
@@ -32,13 +34,18 @@ create_order(Req0) ->
         {more, _Partial, Req} -> reply(413, #{error => body_too_large}, Req)
     end.
 
+show_order({ok, Order}, Req) ->
+    reply(200, Order, Req);
+show_order({error, not_found}, Req) ->
+    reply(404, #{error => not_found}, Req).
+
 validate({ok, Order}, Req) ->
     publish(order_validator:validate(Order), Req);
 validate({error, Reason}, Req) ->
     reply(400, #{error => Reason}, Req).
 
 publish({ok, #{id := Id} = Order}, Req) ->
-    Event = Order#{attempt => 0, created_at => now_rfc3339()},
+    Event = Order#{attempt => 0, created_at => order_clock:now_rfc3339()},
     Result = order_producer:publish(?TOPIC_ORDERS, Id, order_codec:encode(Event)),
     respond(Result, Id, Req);
 publish({error, {Kind, Field}}, Req) ->
@@ -54,7 +61,3 @@ respond({error, Reason}, Id, Req) ->
 reply(Status, Body, Req) ->
     cowboy_req:reply(Status, #{<<"content-type">> => <<"application/json">>},
                      jsx:encode(Body), Req).
-
-now_rfc3339() ->
-    list_to_binary(calendar:system_time_to_rfc3339(erlang:system_time(second),
-                                                   [{offset, "Z"}])).

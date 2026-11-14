@@ -6,7 +6,7 @@ Orders arrive over a REST API, are published to Kafka, and are processed by supe
 
 There is no frontend. You drive it with `curl`, Postman, or a producer script.
 
-> **Status:** in progress. Phases 1 (setup) and 2 (REST API and Kafka producer) of 9 are done. See [Roadmap](#roadmap).
+> **Status:** in progress. Phases 1–3 of 9 are done: orders flow end to end from `POST /orders` through Kafka to a stored `completed` status. Retries, duplicate protection, and crash-recovery tests come in phases 4–6. Until then, a gateway timeout goes straight to `orders.dlq`, and the simulated gateway's failure rates are set to 0. See [Roadmap](#roadmap).
 
 ---
 
@@ -91,7 +91,7 @@ Every topic carries this JSON shape:
 | Kafka client | [`brod`](https://github.com/kafka4beam/brod) |
 | HTTP | `cowboy` |
 | JSON | `jsx` |
-| Fast state | Mnesia (idempotency keys, retry counters) |
+| Fast state | Mnesia (order records until phase 8, then idempotency keys and retry counters) |
 | System of record | PostgreSQL through `epgsql` (phase 8) |
 | Metrics | `prometheus.erl` (phase 9) |
 | Tests | EUnit, PropEr, Common Test, `meck`, Pact |
@@ -126,8 +126,10 @@ docker compose ps                 # wait for kafka: "(healthy)"
 ./scripts/create_topics.sh        # on Windows, run from Git Bash
 
 # 4. Build the dev image and start the app (interactive Erlang shell on :8080)
-docker compose run --rm --service-ports app rebar3 shell
+docker compose run --rm --service-ports app rebar3 shell --sname order_processing
 ```
+
+The `--sname` matters: Mnesia stores orders on disk under the node name (`order_processing@app`), so the name must stay the same between runs.
 
 The first run downloads and compiles dependencies, which takes a few minutes. Later runs are fast, because build output and the package cache live in Docker volumes.
 
@@ -153,6 +155,8 @@ docker compose --profile dev down
 ```
 
 > Kafka has no data volume, so topics are lost when its container is removed or recreated. Run `./scripts/create_topics.sh` again after `down`. The script is safe to re-run.
+>
+> Stored orders live in the `mnesia_data` volume and survive `down`. To wipe them, run `docker compose --profile dev down -v`. That also deletes the build cache volumes, so the next start recompiles.
 
 ---
 
@@ -161,7 +165,7 @@ docker compose --profile dev down
 | Method and path | Purpose | Responses |
 | --- | --- | --- |
 | `POST /orders` | Validate and publish an order | `202` with order ID; `400` invalid body; `413` body too large; `503` Kafka unavailable |
-| `GET /orders/:id` | Current order status | `200` with order; `404` unknown *(phase 3)* |
+| `GET /orders/:id` | Current order status | `200` with order; `404` unknown or not yet processed |
 | `GET /metrics` | Prometheus scrape endpoint | `200` *(phase 9)* |
 | `GET /health` | Liveness check | `200` |
 
@@ -175,6 +179,18 @@ curl -X POST localhost:8080/orders \
   -d '{"id":"o-1001","customer_id":"c-42","amount":1500,"currency":"INR","items":[{"sku":"SKU-1","qty":2}]}'
 # 202 {"id":"o-1001"}
 ```
+
+### Check its status
+
+The order is processed asynchronously, usually within a second or two:
+
+```bash
+curl localhost:8080/orders/o-1001
+# 200 {"id":"o-1001","status":"completed","customer_id":"c-42","amount":1500,"currency":"INR",
+#      "items":[{"sku":"SKU-1","qty":2}],"attempt":0,"created_at":"...","updated_at":1794685666388}
+```
+
+`status` is `completed` or `failed` (payment declined). `updated_at` is Unix time in milliseconds. An order that has not been consumed yet returns `404`.
 
 ### Validation rules
 
@@ -198,9 +214,20 @@ curl -X POST localhost:8080/orders -H 'content-type: application/json' \
 ```bash
 # MSYS_NO_PATHCONV=1 stops Git Bash on Windows from rewriting /opt/... into a Windows path
 MSYS_NO_PATHCONV=1 docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic orders --from-beginning \
+  --bootstrap-server localhost:9092 --topic orders.completed --from-beginning \
   --property print.key=true --property print.partition=true
 ```
+
+Swap the topic for `orders` or `orders.dlq` to see those. To see the consumer group's committed offsets and lag:
+
+```bash
+MSYS_NO_PATHCONV=1 docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group order_consumers
+```
+
+### Try a failure
+
+Set `{gateway_decline_rate, 1.0}` in `config/sys.config` and restart the app. Every order is then declined: `GET` shows `"status":"failed"`, and the order appears on `orders.dlq` with `"reason":"declined"`. A message that is not valid JSON goes to `orders.dlq` too, base64-encoded, so a bad message never blocks its partition.
 
 ---
 
@@ -211,25 +238,25 @@ Run every command inside the app container, with Kafka and PostgreSQL up (`docke
 ```bash
 docker compose run --rm app rebar3 compile
 docker compose run --rm app rebar3 eunit --cover
-docker compose run --rm app rebar3 ct --dir test/ct --suite order_producer_SUITE --cover
+docker compose run --rm app rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE --cover
 docker compose run --rm app rebar3 cover --verbose     # coverage summary
 docker compose run --rm app rebar3 dialyzer
 ```
 
-The unit and Common Test suites do **not** need Kafka. The producer is mocked at its edge, so they run fast and give the same result every time.
+The unit and Common Test suites do **not** need Kafka. The Kafka client, the consumer group, and the payment gateway are mocked at their edges, and Mnesia runs in RAM, so the suites run fast, give the same result every time, and leave no files behind.
 
 | Layer | Tool | Covers | Location |
 | --- | --- | --- | --- |
-| Unit | EUnit, PropEr | Validation, JSON codec (with a property-based round trip), backoff, idempotency decisions | `test/unit/` |
-| Integration | Common Test, `meck` | HTTP and producer behaviour, supervision, retry to DLQ, duplicates, shutdown | `test/ct/` |
+| Unit | EUnit, PropEr | Validation, JSON codec (with a property-based round trip), processor outcomes, Mnesia store, simulated gateway | `test/unit/` |
+| Integration | Common Test, `meck` | HTTP API, consumer outcomes (completed, declined, timeout, invalid, poison message), `GET /orders/:id`; later supervision, retries, duplicates | `test/ct/` |
 | Contract | Pact message pact | Shape of the `order.created` event between producer and consumer | `test/pact/` *(phase 7)* |
 | End-to-end | Common Test | Real Kafka: post, crash a worker, assert every order completes | `test/ct/e2e_SUITE.erl` *(phase 9)* |
 
 **Current results:**
-- EUnit: 45 tests pass, including 300 generated PropEr round-trip cases.
-- Producer CT suite: all 6 cases pass.
+- EUnit: 65 tests pass, including 300 generated PropEr round-trip cases.
+- Common Test: all 13 cases pass (consumer suite 7, producer suite 6).
 - Dialyzer: clean.
-- Line coverage: 90%.
+- Line coverage: 88%. `order_producer` shows 0% because tests replace it with a mock; a live run against Kafka exercises it.
 
 ---
 
@@ -243,16 +270,24 @@ The unit and Common Test suites do **not** need Kafka. The producer is mocked at
 ├── docs/
 │   └── IMPLEMENTATION_GUIDE.md   architecture, data shapes, semantics, milestones
 ├── include/
-│   └── order_topics.hrl      Kafka topic names, defined once
+│   ├── order_topics.hrl      Kafka topic names, defined once
+│   └── order_tables.hrl      Mnesia records and table names, defined once
 ├── scripts/
 │   └── create_topics.sh      creates the four topics (safe to re-run)
 ├── src/
 │   ├── order_app.erl         application entry point
 │   ├── order_sup.erl         top-level supervisor
-│   ├── order_http_handler.erl   thin HTTP shell: decode, validate, publish
+│   ├── order_http_handler.erl   thin HTTP shell: POST /orders, GET /orders/:id, /health
 │   ├── order_validator.erl   pure: field and amount checks
-│   ├── order_codec.erl       pure: JSON encode and decode
-│   └── order_producer.erl    the only module that publishes to Kafka
+│   ├── order_codec.erl       pure: JSON encode and decode, DLQ messages
+│   ├── order_producer.erl    the only module that publishes to Kafka
+│   ├── consumer_worker.erl   thin Kafka shell: decode, process, publish outcome, commit
+│   ├── order_processor.erl   business flow, returns retryable or fatal errors
+│   ├── payment_gateway.erl   simulated gateway with configurable failure rates
+│   ├── order_store.erl       storage behaviour, implementation chosen in config
+│   ├── order_store_mnesia.erl   Mnesia implementation
+│   ├── order_mnesia.erl      creates the schema and tables at boot
+│   └── order_clock.erl       the one place the app reads the clock
 ├── test/
 │   ├── unit/                 EUnit and PropEr
 │   └── ct/                   Common Test suites
@@ -266,15 +301,15 @@ The unit and Common Test suites do **not** need Kafka. The producer is mocked at
 ```
 order_app
 └── order_sup (one_for_one)
-    ├── producer_sup        brod producer client          ✅
+    ├── producer_sup        brod client                   ✅
+    ├── consumer_sup        one worker per partition      ✅ basic; crash-recovery tests in phase 4
     ├── http_sup            cowboy listener               ✅
-    ├── consumer_sup        one worker per partition      (phase 4)
     ├── retry_manager       delayed retries               (phase 5)
     ├── idempotency_store   Mnesia-backed                 (phase 6)
     └── metrics_server                                    (phase 9)
 ```
 
-The producer starts before the HTTP listener, so on shutdown the listener stops first and no request is accepted that cannot be published.
+Children start in the order shown and stop in reverse. On shutdown, HTTP stops first, then the consumers, then the producer they both depend on.
 
 ---
 
@@ -296,8 +331,8 @@ For the full specification, see [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTA
 | --- | --- | --- | --- |
 | 1. Setup | `rebar3` app, Docker Compose, topics script | Kafka runs and the app boots | ✅ |
 | 2. API and producer | cowboy handler, validator, codec, producer | `curl POST /orders` puts a message on `orders` | ✅ |
-| 3. Basic consumer | `consumer_worker`, `order_processor`, Mnesia store | An order is consumed and `GET /orders/:id` shows `completed` | ⏳ next |
-| 4. Supervision | `consumer_sup`, one worker per partition, manual commits | Killing a worker restarts it and no order is lost | |
+| 3. Basic consumer | `consumer_worker`, `order_processor`, Mnesia store | An order is consumed and `GET /orders/:id` shows `completed` | ✅ |
+| 4. Supervision | `consumer_sup`, one worker per partition, manual commits | Killing a worker restarts it and no order is lost | ⏳ next |
 | 5. Retry and DLQ | `retry_policy`, `retry_manager`, error classification | A failing order retries three times, then lands on `orders.dlq` | |
 | 6. Idempotency | `idempotency_store`, gateway idempotency key | The same order sent twice is charged once | |
 | 7. Contract tests | Pact file and suites | Renaming a field on the producer fails the build | |
@@ -316,6 +351,12 @@ The `brod` client exits at startup if no broker is reachable. Make sure Kafka sh
 
 **`create_topics.sh` fails with `no such file or directory: C:/Program Files/Git/opt/kafka/...`.**
 Git Bash is rewriting the container path. The script sets `MSYS_NO_PATHCONV=1` itself; set it yourself when you run `docker compose exec` by hand.
+
+**`GET /orders/:id` returns `404` right after a `202`.**
+Processing is asynchronous, so wait a second and retry. If it stays `404`, check `docker compose logs app` for `order_dead_lettered`: an order that fails validation or times out is not stored, and goes to `orders.dlq` instead.
+
+**The app fails at boot with a Mnesia error after you changed the node name.**
+Disc tables belong to the node that created them. Start the shell with `--sname order_processing`, or wipe the data with `docker compose --profile dev down -v`.
 
 **A port is already in use (8080, 9092, or 5432).**
 Stop whatever holds the port, or change the host side of the port mapping in `docker-compose.yml`.

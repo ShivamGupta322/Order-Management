@@ -2,7 +2,7 @@
 
 %% The only module that publishes to Kafka. Tests replace it with meck.
 
--export([start_link/0, publish/3]).
+-export([start_link/0, publish/3, client/0]).
 
 -define(CLIENT, order_producer_client).
 -define(DEFAULT_ENDPOINTS, [{"localhost", 9092}]).
@@ -16,6 +16,11 @@ start_link() ->
     brod:start_link_client(Endpoints, ?CLIENT,
                            [{auto_start_producers, true},
                             {default_producer_config, []}]).
+
+%% The brod client is shared with consumer_worker's group subscriber.
+-spec client() -> atom().
+client() ->
+    ?CLIENT.
 
 %% Synchronous publish, partitioned by hashing Key so one order always lands
 %% on the same partition. Returns once the broker acknowledges the write.
