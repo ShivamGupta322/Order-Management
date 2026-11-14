@@ -4,7 +4,7 @@
 %% fatal, so the caller can choose retry or dead-letter without inspecting
 %% the reason.
 
--export([process/1]).
+-export([process/1, fail/1]).
 -export_type([result/0]).
 
 -type result() :: {ok, payment_gateway:receipt()}
@@ -25,5 +25,10 @@ settle({ok, Receipt}, Order) ->
 settle({error, timeout}, _Order) ->
     {error, retryable, timeout};
 settle({error, declined}, Order) ->
-    ok = order_store:save(Order#{status => failed}),
+    ok = fail(Order),
     {error, fatal, declined}.
+
+%% Records a validated order as failed, e.g. when its retries are used up.
+-spec fail(order_codec:order()) -> ok.
+fail(Order) ->
+    ok = order_store:save(Order#{status => failed}).

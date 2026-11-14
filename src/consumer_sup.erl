@@ -33,7 +33,7 @@ init([]) ->
     %% offset commits in terminate/2, so it needs time, never brutal_kill.
     Shutdown = application:get_env(order_app, consumer_shutdown_ms, ?DEFAULT_SHUTDOWN_MS),
     Child = #{id => consumer_group,
-              start => {consumer_worker, start_link, []},
+              start => {consumer_worker, start_link, [orders]},
               restart => permanent,
               shutdown => Shutdown,
               type => worker},

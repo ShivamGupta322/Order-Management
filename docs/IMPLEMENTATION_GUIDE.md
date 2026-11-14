@@ -89,8 +89,10 @@ order_app
     │           ├── worker for partition 0   (consumer_worker callbacks)
     │           ├── worker for partition 1
     │           └── worker for partition 2
+    ├── retry_sup           supervisor (one_for_all)
+    │     ├── retry_manager     gen_server holding retries until not_before
+    │     └── retry_group       brod_group_subscriber_v2 on orders.retry
     ├── http_sup            cowboy listener
-    ├── retry_manager       gen_server for delayed retries
     ├── idempotency_store   Mnesia-backed
     └── metrics_server
 ```
@@ -267,10 +269,17 @@ next(_) -> dead_letter.
 
 - The worker never sleeps on a failed order. It publishes the order to `orders.retry` with `attempt + 1` and a `not_before` timestamp, commits, and moves on, so one bad order cannot block a partition.
 - `retry_manager` consumes `orders.retry`, waits until `not_before`, and republishes to `orders`. The simplest correct version handles one message at a time and commits after republishing.
+- **How that is built.** `consumer_worker` runs a second consumer group, `order_retry`, on `orders.retry`. Its retry-role callback hands each message to `retry_manager:schedule/1` and does not commit. `retry_manager` is a gen_server with one FIFO queue per partition. It arms `erlang:send_after/3` for the head of each queue (it never sleeps). When the timer fires it publishes the order to `orders`, then calls the message's `commit_fun`.
+- **Why one queue per partition.** Commits happen strictly in offset order, so a crash can never commit past a retry that was not yet republished. The cost is head-of-line blocking: a 1 s retry queued behind a 30 s one waits for it. That only ever lengthens a delay.
+- **Supervision.** `retry_manager` holds the group's uncommitted messages in memory, so it and the retry group share a `one_for_all` supervisor, `retry_sup`. If either dies, both restart and Kafka redelivers whatever was not committed. A retry message that cannot be decoded is queued as a DLQ publish, so it too is committed in offset order.
+- **Retry message shape.** A retry message is the order event plus `not_before`, in Unix milliseconds. `not_before` is stripped when the order goes back on `orders`.
+- **Delays** come from `retry_delays_ms` (default `[1000, 5000, 30000]`), passed into `retry_policy:next/2`.
+- **When retries run out,** `order_processor:fail/1` stores the order as `failed` before it is dead-lettered.
+- **Bad `attempt` values.** `order_validator` rejects an `attempt` that is not a non-negative integer. Otherwise a malformed `attempt` would crash the retry decision on every redelivery and stall the partition.
 - Errors are classified. A timeout is retryable. A validation failure or a declined payment is fatal and goes straight to the DLQ.
 - A DLQ message carries the original order plus `reason`, `attempt`, and `failed_at`. `reason` is a string such as `"declined"`, `"timeout"`, or `"invalid:amount"`.
 - A message that cannot be decoded has no order to carry. Its DLQ message is `{"raw_base64": ..., "reason": "malformed_json" | "not_an_object", "failed_at": ...}`. The raw bytes are base64-encoded because they may not be valid UTF-8, which JSON strings require. It is keyed by the original Kafka key.
-- Until `retry_manager` exists (phase 5), retryable failures are dead-lettered too, and the simulated gateway's failure rates default to 0.0 in `sys.config`.
+- The simulated gateway's failure rates in `sys.config` are 0.1 for timeouts and 0.02 for declines. Set `gateway_timeout_rate` to 1.0 to watch an order retry three times and land on the DLQ.
 - `consumer_worker` is a `brod_group_subscriber_v2` callback module in consumer group `order_consumers`. brod runs one callback process per assigned partition. It shares the `brod` client started by `order_producer`.
 
 ### Idempotency
@@ -534,7 +543,7 @@ One suite runs against the real Kafka from Docker Compose and is kept out of the
 
 - [x] Post an order, then poll `GET /orders/:id` until it reads `completed`
 - [x] Kill a worker mid-run and assert every posted order still completes
-- [ ] Force failures and assert the order appears on `orders.dlq`
+- [x] Force failures and assert the order appears on `orders.dlq`
 
 `e2e_SUITE` skips itself if Kafka is unreachable. Each run uses a fresh consumer group starting at `latest`, so history is not replayed. `latest` only applies to a partition with no committed offset, and a restart before a partition's first commit would skip messages that arrived meanwhile. So the suite first sends one order to each partition and waits until the group has committed on all three.
 

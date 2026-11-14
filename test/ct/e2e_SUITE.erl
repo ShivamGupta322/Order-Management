@@ -22,7 +22,8 @@
 
 all() ->
     [order_completes_end_to_end,
-     killed_worker_loses_no_orders].
+     killed_worker_loses_no_orders,
+     failing_order_retries_then_lands_on_dlq].
 
 init_per_suite(Config) ->
     case gen_tcp:connect(?KAFKA_HOST, ?KAFKA_PORT, [], 2000) of
@@ -39,6 +40,8 @@ start(Config) ->
            {mnesia_copies, ram_copies},
            {kafka_endpoints, [{?KAFKA_HOST, ?KAFKA_PORT}]},
            {consumer_group_id, <<"e2e-", RunId/binary>>},
+           {retry_group_id, <<"e2e-retry-", RunId/binary>>},
+           {retry_delays_ms, [200, 200, 200]},
            {consumer_begin_offset, latest},
            {offset_commit_interval_seconds, 1},
            {gateway_timeout_rate, 0.0},
@@ -73,7 +76,7 @@ killed_worker_loses_no_orders(Config) ->
     {First, Rest} = lists:split(?BATCH div 3, Ids),
     [?assertEqual(202, post_order(Id)) || Id <- First],
     {ok, Subscriber} = consumer_sup:subscriber(),
-    {ok, #{0 := Worker}} = consumer_worker:partition_workers(),
+    {ok, #{0 := Worker}} = consumer_worker:partition_workers(orders),
     exit(Worker, kill),
     [?assertEqual(202, post_order(Id)) || Id <- Rest],
     ok = order_test_helper:wait_until(
@@ -81,16 +84,38 @@ killed_worker_loses_no_orders(Config) ->
     {ok, NewSubscriber} = consumer_sup:subscriber(),
     ?assertNotEqual(Subscriber, NewSubscriber).
 
+%% A gateway that always times out: three retries through orders.retry and
+%% retry_manager, then the order is marked failed and lands on orders.dlq.
+failing_order_retries_then_lands_on_dlq(Config) ->
+    ok = application:set_env(order_app, gateway_timeout_rate, 1.0),
+    Id = order_id(Config, <<"dlq">>, 1),
+    DlqBefore = topic_end_offsets(<<"orders.dlq">>),
+    RetryBefore = topic_end_offsets(<<"orders.retry">>),
+    ?assertEqual(202, post_order(Id)),
+    ok = order_test_helper:wait_until(fun() -> status(Id) =:= <<"failed">> end, 30000),
+    ok = application:set_env(order_app, gateway_timeout_rate, 0.0),
+    ok = order_test_helper:wait_until(
+           fun() -> topic_end_offsets(<<"orders.dlq">>) >= DlqBefore + 1 end, 10000),
+    ?assertEqual(RetryBefore + 3, topic_end_offsets(<<"orders.retry">>)).
+
 %%--------------------------------------------------------------------
 
 wait_for_assignment() ->
     order_test_helper:wait_until(
-      fun() ->
-              case consumer_worker:partition_workers() of
-                  {ok, Workers} -> map_size(Workers) =:= ?PARTITIONS;
-                  {error, _} -> false
-              end
-      end, 30000).
+      fun() -> assigned(orders) andalso assigned(retry) end, 30000).
+
+assigned(Role) ->
+    case consumer_worker:partition_workers(Role) of
+        {ok, Workers} -> map_size(Workers) =:= ?PARTITIONS;
+        {error, _} -> false
+    end.
+
+%% Total messages ever written to Topic, summed over its partitions.
+topic_end_offsets(Topic) ->
+    lists:sum([begin
+                   {ok, Offset} = brod:resolve_offset([{?KAFKA_HOST, ?KAFKA_PORT}], Topic, P, latest),
+                   Offset
+               end || P <- lists:seq(0, ?PARTITIONS - 1)]).
 
 warm_up(Config, GroupId) ->
     Ids = [warm_up_id(Config, P, 1) || P <- lists:seq(0, ?PARTITIONS - 1)],
@@ -125,12 +150,13 @@ post_order(Id) ->
     Status.
 
 completed(Id) ->
+    status(Id) =:= <<"completed">>.
+
+status(Id) ->
     case httpc:request(get, {url("/orders/" ++ binary_to_list(Id)), []}, [],
                        [{body_format, binary}]) of
-        {ok, {{_, 200, _}, _, Body}} ->
-            maps:get(<<"status">>, jsx:decode(Body, [return_maps])) =:= <<"completed">>;
-        {ok, {{_, 404, _}, _, _}} ->
-            false
+        {ok, {{_, 200, _}, _, Body}} -> maps:get(<<"status">>, jsx:decode(Body, [return_maps]));
+        {ok, {{_, 404, _}, _, _}} -> not_found
     end.
 
 url(Path) ->

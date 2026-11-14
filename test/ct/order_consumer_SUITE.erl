@@ -6,7 +6,12 @@
 all() ->
     [completed_order_is_saved_and_published,
      declined_order_goes_to_dlq_and_is_marked_failed,
-     gateway_timeout_goes_to_dlq,
+     timeout_publishes_retry_with_next_attempt,
+     exhausted_retries_go_to_dlq_and_mark_failed,
+     retry_is_republished_after_not_before,
+     retries_commit_in_offset_order,
+     poison_retry_message_goes_to_dlq_and_commits,
+     failed_order_goes_to_dlq,
      invalid_order_goes_to_dlq_without_charging,
      poison_message_goes_to_dlq_and_commits,
      get_order_returns_stored_order,
@@ -49,13 +54,90 @@ declined_order_goes_to_dlq_and_is_marked_failed(_Config) ->
                  jsx:decode(Payload, [return_maps])),
     ?assertEqual([], order_test_helper:published(<<"orders.completed">>)).
 
-%% Phase 3 behaviour: retryable failures are dead-lettered until phase 5.
-gateway_timeout_goes_to_dlq(_Config) ->
+timeout_publishes_retry_with_next_attempt(_Config) ->
     ok = meck:expect(payment_gateway, charge, fun(_) -> {error, timeout} end),
+    Before = order_clock:now_ms(),
     ?assertMatch({ok, commit, _}, order_test_helper:feed(order(<<"o-3">>))),
-    [Payload] = order_test_helper:published(<<"orders.dlq">>),
-    ?assertMatch(#{<<"reason">> := <<"timeout">>}, jsx:decode(Payload, [return_maps])),
+    [Payload] = order_test_helper:published(<<"orders.retry">>),
+    {ok, Retried, NotBefore} = order_codec:decode_retry(Payload),
+    ?assertEqual((order(<<"o-3">>))#{attempt => 1}, Retried),
+    ?assert(NotBefore >= Before + 1000 andalso NotBefore =< order_clock:now_ms() + 1000),
+    ?assertEqual([], order_test_helper:published(<<"orders.dlq">>)),
     ?assertEqual({error, not_found}, order_store:get(<<"o-3">>)).
+
+exhausted_retries_go_to_dlq_and_mark_failed(_Config) ->
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {error, timeout} end),
+    Order = (order(<<"o-7">>))#{attempt => 3},
+    ?assertMatch({ok, commit, _}, order_test_helper:feed(Order)),
+    ?assertEqual([], order_test_helper:published(<<"orders.retry">>)),
+    [Payload] = order_test_helper:published(<<"orders.dlq">>),
+    ?assertMatch(#{<<"reason">> := <<"timeout">>, <<"attempt">> := 3},
+                 jsx:decode(Payload, [return_maps])),
+    ?assertMatch({ok, #{status := failed, attempt := 3}}, order_store:get(<<"o-7">>)).
+
+retry_is_republished_after_not_before(_Config) ->
+    Order = (order(<<"o-8">>))#{attempt => 1},
+    NotBefore = order_clock:now_ms() + 300,
+    ?assertMatch({ok, _}, order_test_helper:feed_retry(11, <<"o-8">>,
+                                                       order_codec:encode_retry(Order, NotBefore))),
+    %% Not committed until republished.
+    receive {committed, _} -> ct:fail(committed_early) after 0 -> ok end,
+    ok = order_test_helper:wait_until(
+           fun() -> order_test_helper:published(<<"orders">>) =/= [] end, 5000),
+    ?assert(order_clock:now_ms() >= NotBefore),
+    [Payload] = order_test_helper:published(<<"orders">>),
+    ?assertEqual({ok, Order}, order_codec:decode(Payload)),
+    ?assert(meck:called(order_producer, publish, [<<"orders">>, <<"o-8">>, '_'])),
+    receive {committed, Offset} -> ?assertEqual(11, Offset) after 2000 -> ct:fail(no_commit) end.
+
+%% A due retry behind a later one waits for it, so commits never skip ahead.
+retries_commit_in_offset_order(_Config) ->
+    Now = order_clock:now_ms(),
+    Late = (order(<<"o-9">>))#{attempt => 1},
+    Due = (order(<<"o-10">>))#{attempt => 1},
+    {ok, _} = order_test_helper:feed_retry(21, <<"o-9">>, order_codec:encode_retry(Late, Now + 300)),
+    {ok, _} = order_test_helper:feed_retry(22, <<"o-10">>, order_codec:encode_retry(Due, Now)),
+    ok = order_test_helper:wait_until(
+           fun() -> length(order_test_helper:published(<<"orders">>)) =:= 2 end, 5000),
+    ?assertEqual([{ok, Late}, {ok, Due}],
+                 [order_codec:decode(P) || P <- order_test_helper:published(<<"orders">>)]),
+    ?assertEqual([21, 22], [receive {committed, O} -> O after 2000 -> timeout end || _ <- [1, 2]]).
+
+poison_retry_message_goes_to_dlq_and_commits(_Config) ->
+    {ok, _} = order_test_helper:feed_retry(31, <<"p-2">>, <<"{\"id\":\"p-2\"}">>),
+    ok = order_test_helper:wait_until(
+           fun() -> order_test_helper:published(<<"orders.dlq">>) =/= [] end, 5000),
+    [Payload] = order_test_helper:published(<<"orders.dlq">>),
+    ?assertMatch(#{<<"reason">> := <<"invalid_not_before">>}, jsx:decode(Payload, [return_maps])),
+    ?assertEqual([], order_test_helper:published(<<"orders">>)),
+    receive {committed, Offset} -> ?assertEqual(31, Offset) after 2000 -> ct:fail(no_commit) end.
+
+%% The guide's scenario: a gateway that always times out is tried four times
+%% (attempts 0-3), retried three times, then the order lands on orders.dlq.
+%% Short delays keep it fast; the full loop goes through retry_manager.
+failed_order_goes_to_dlq(_Config) ->
+    ok = application:set_env(order_app, retry_delays_ms, [10, 20, 30]),
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {error, timeout} end),
+    {ok, commit, _} = order_test_helper:feed(order(<<"bad-1">>)),
+    ok = lists:foreach(fun retry_round/1, [1, 2, 3]),
+    ?assertEqual(4, meck:num_calls(payment_gateway, charge, '_')),
+    ?assertEqual(3, length(order_test_helper:published(<<"orders.retry">>))),
+    [Payload] = order_test_helper:published(<<"orders.dlq">>),
+    ?assertMatch(#{<<"id">> := <<"bad-1">>, <<"reason">> := <<"timeout">>, <<"attempt">> := 3},
+                 jsx:decode(Payload, [return_maps])),
+    ?assertMatch({ok, #{status := failed}}, order_store:get(<<"bad-1">>)).
+
+%% Takes retry message N from orders.retry, passes it through retry_manager,
+%% and feeds the republished order back to the orders consumer.
+retry_round(N) ->
+    RetryPayload = lists:nth(N, order_test_helper:published(<<"orders.retry">>)),
+    {ok, _} = order_test_helper:feed_retry(100 + N, <<"bad-1">>, RetryPayload),
+    ok = order_test_helper:wait_until(
+           fun() -> length(order_test_helper:published(<<"orders">>)) =:= N end, 5000),
+    {ok, Republished} = order_codec:decode(lists:nth(N, order_test_helper:published(<<"orders">>))),
+    ?assertEqual(N, maps:get(attempt, Republished)),
+    {ok, commit, _} = order_test_helper:feed(Republished),
+    receive {committed, _} -> ok after 2000 -> ct:fail(no_commit) end.
 
 invalid_order_goes_to_dlq_without_charging(_Config) ->
     Order = (order(<<"o-4">>))#{amount => -5},

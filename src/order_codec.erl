@@ -2,7 +2,8 @@
 
 %% JSON encode/decode of order events. Pure: no processes, no I/O.
 
--export([encode/1, decode/1, encode_dead_letter/3, encode_dead_letter_raw/3]).
+-export([encode/1, decode/1, encode_retry/2, decode_retry/1,
+         encode_dead_letter/3, encode_dead_letter_raw/3]).
 -export_type([order/0, item/0, decode_error/0]).
 
 -type item() :: #{sku => binary(), qty => integer()}.
@@ -13,7 +14,7 @@
                    items => [item()],
                    attempt => non_neg_integer(),
                    created_at => binary()}.
--type decode_error() :: malformed_json | not_an_object.
+-type decode_error() :: malformed_json | not_an_object | invalid_not_before.
 -type reason() :: atom() | {atom(), atom()}.
 
 %% Known JSON keys and the atoms they map to. Only these become atoms, so
@@ -30,6 +31,24 @@
 -spec encode(order()) -> binary().
 encode(Order) ->
     jsx:encode(Order).
+
+%% A retry message is the order plus `not_before': the earliest time, in Unix
+%% milliseconds, it may go back on `orders'.
+-spec encode_retry(order(), NotBefore :: integer()) -> binary().
+encode_retry(Order, NotBefore) when is_integer(NotBefore) ->
+    jsx:encode(Order#{not_before => NotBefore}).
+
+-spec decode_retry(binary()) -> {ok, order(), NotBefore :: integer()} | {error, decode_error()}.
+decode_retry(Json) when is_binary(Json) ->
+    retry_from_json(parse(Json)).
+
+retry_from_json({ok, #{<<"not_before">> := NotBefore} = Map}) when is_integer(NotBefore) ->
+    {ok, Order} = from_json({ok, Map}),
+    {ok, Order, NotBefore};
+retry_from_json({ok, Map}) when is_map(Map) ->
+    {error, invalid_not_before};
+retry_from_json(Other) ->
+    from_json(Other).
 
 %% A DLQ message is the original order plus why and when it failed.
 -spec encode_dead_letter(map(), reason(), FailedAt :: binary()) -> binary().

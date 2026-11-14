@@ -44,6 +44,19 @@ id_test_() ->
      ?_assertEqual({error, {invalid, customer_id}}, Validate(customer_id, <<>>)),
      ?_assertEqual({error, {invalid, customer_id}}, Validate(customer_id, null))].
 
+attempt_test_() ->
+    Validate = fun(Attempt) -> order_validator:validate((valid_order())#{attempt => Attempt}) end,
+    [?_assertMatch({ok, _}, Validate(0)),
+     ?_assertMatch({ok, _}, Validate(3)),
+     ?_assertEqual({error, {invalid, attempt}}, Validate(-1)),
+     ?_assertEqual({error, {invalid, attempt}}, Validate(1.0)),
+     ?_assertEqual({error, {invalid, attempt}}, Validate(<<"1">>))].
+
+%% Required fields are reported before a bad optional attempt.
+attempt_checked_last_test() ->
+    ?assertEqual({error, {missing, items}},
+                 order_validator:validate(maps:remove(items, (valid_order())#{attempt => -1}))).
+
 items_test_() ->
     Validate = fun(Items) -> order_validator:validate((valid_order())#{items => Items}) end,
     [?_assertEqual({error, {invalid, items}}, Validate([])),

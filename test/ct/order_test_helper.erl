@@ -1,13 +1,14 @@
 -module(order_test_helper).
 
 %% Shared CT setup: runs order_app without a broker by stubbing the Kafka
-%% edges (order_producer, consumer_worker:start_link/0) and payment_gateway,
-%% with Mnesia in RAM so no files are left behind.
+%% edges (order_producer, consumer_worker:start_link/1 for both consumer
+%% groups) and payment_gateway, with Mnesia in RAM so no files are left
+%% behind. retry_manager runs for real.
 
 -include_lib("brod/include/brod.hrl").
 
 -export([start_app/0, stop_app/0, reset/0, base_url/0, feed/1, feed_raw/2,
-         published/1, receipt/0, wait_until/2]).
+         feed_retry/3, published/1, receipt/0, wait_until/2]).
 
 -define(POLL_INTERVAL_MS, 50).
 
@@ -20,7 +21,7 @@ start_app() ->
     ok = meck:new(order_producer, [no_link]),
     ok = meck:expect(order_producer, start_link, fun start_stub/0),
     ok = meck:new(consumer_worker, [passthrough, no_link]),
-    ok = meck:expect(consumer_worker, start_link, fun start_stub/0),
+    ok = meck:expect(consumer_worker, start_link, fun(_Role) -> start_stub() end),
     ok = meck:new(payment_gateway, [no_link]),
     ok = reset(),
     {ok, _} = application:ensure_all_started(order_app),
@@ -38,7 +39,12 @@ reset() ->
     ok = meck:expect(order_producer, publish, fun(_Topic, _Key, _Value) -> ok end),
     ok = meck:expect(payment_gateway, charge, fun(_Order) -> {ok, receipt()} end),
     ok = meck:reset(?MOCKS),
+    ok = application:unset_env(order_app, retry_delays_ms),
+    ok = flush_commits(),
     clear_tables().
+
+flush_commits() ->
+    receive {committed, _} -> flush_commits() after 0 -> ok end.
 
 clear_tables() ->
     case mnesia:system_info(is_running) of
@@ -54,15 +60,25 @@ feed(#{id := Id} = Order) ->
     feed_raw(Id, jsx:encode(Order)).
 
 feed_raw(Key, Value) ->
+    handle(orders, <<"orders">>, erlang:unique_integer([positive]), Key, Value,
+           fun(_) -> ok end).
+
+%% Hands a message to the retry-role callback. Its commit, made later by
+%% retry_manager, arrives at the calling process as {committed, Offset}.
+feed_retry(Offset, Key, Value) ->
+    Self = self(),
+    handle(retry, <<"orders.retry">>, Offset, Key, Value,
+           fun(O) -> Self ! {committed, O}, ok end).
+
+handle(Role, Topic, Offset, Key, Value, Commit) ->
     {ok, State} = consumer_worker:init(#{group_id => <<"test">>,
-                                         topic => <<"orders">>,
+                                         topic => Topic,
                                          partition => 0,
-                                         commit_fun => fun(_) -> ok end,
+                                         commit_fun => Commit,
                                          ack_fun => fun(_) -> ok end},
-                                       undefined),
-    Message = #kafka_message{offset = erlang:unique_integer([positive]),
-                             key = Key, value = Value},
-    consumer_worker:handle_message(Message, State).
+                                       Role),
+    consumer_worker:handle_message(#kafka_message{offset = Offset, key = Key, value = Value},
+                                   State).
 
 %% Values published to Topic since the last reset, oldest first.
 published(Topic) ->

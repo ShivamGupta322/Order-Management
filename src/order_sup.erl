@@ -18,8 +18,8 @@ init([]) ->
     %% 5 restarts in 10 s lets transient faults heal but escalates a crash loop.
     SupFlags = #{strategy => one_for_one, intensity => 5, period => 10},
     %% Children stop in reverse start order, so on shutdown HTTP stops first,
-    %% then consumers, then the producer both of them depend on.
-    {ok, {SupFlags, [producer_spec(), consumer_spec(), http_spec()]}}.
+    %% then retries and consumers, then the producer all of them depend on.
+    {ok, {SupFlags, [producer_spec(), consumer_spec(), retry_spec(), http_spec()]}}.
 
 producer_spec() ->
     #{id => producer_sup,
@@ -34,6 +34,13 @@ consumer_spec() ->
       start => {consumer_sup, start_link, []},
       restart => permanent,
       %% consumer_sup bounds its own child's shutdown time.
+      shutdown => infinity,
+      type => supervisor}.
+
+retry_spec() ->
+    #{id => retry_sup,
+      start => {retry_sup, start_link, []},
+      restart => permanent,
       shutdown => infinity,
       type => supervisor}.
 

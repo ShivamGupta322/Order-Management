@@ -1,13 +1,14 @@
 -module(order_validator).
 
-%% Field and amount checks for client-supplied order fields. Pure: no
-%% processes, no I/O. `attempt` and `created_at` are set by the server, so
-%% they are not checked here.
+%% Field and amount checks for order fields. Pure: no processes, no I/O.
+%% `attempt` is optional (the server sets it), but when present it must be a
+%% non-negative integer: a bad one would crash the retry decision on every
+%% redelivery and stall the partition.
 
 -export([validate/1]).
 -export_type([field/0, reason/0]).
 
--type field() :: id | customer_id | amount | currency | items.
+-type field() :: id | customer_id | amount | currency | items | attempt.
 -type reason() :: {missing | invalid, field()}.
 
 -define(CURRENCIES, [<<"INR">>, <<"USD">>, <<"EUR">>, <<"GBP">>]).
@@ -20,7 +21,7 @@ validate(Order) when is_map(Order) ->
     check(Order, ?FIELDS).
 
 check(Order, []) ->
-    {ok, Order};
+    check_attempt(maps:find(attempt, Order), Order);
 check(Order, [Field | Rest]) ->
     check_field(Field, maps:find(Field, Order), Order, Rest).
 
@@ -31,6 +32,13 @@ check_field(Field, {ok, Value}, Order, Rest) ->
         true -> check(Order, Rest);
         false -> {error, {invalid, Field}}
     end.
+
+check_attempt(error, Order) ->
+    {ok, Order};
+check_attempt({ok, Attempt}, Order) when is_integer(Attempt), Attempt >= 0 ->
+    {ok, Order};
+check_attempt({ok, _Invalid}, _Order) ->
+    {error, {invalid, attempt}}.
 
 valid(id, Value) -> non_empty_binary(Value);
 valid(customer_id, Value) -> non_empty_binary(Value);

@@ -8,7 +8,8 @@ processor_test_() ->
      [fun success_saves_completed/1,
       fun timeout_is_retryable_and_not_saved/1,
       fun decline_is_fatal_and_saved_failed/1,
-      fun invalid_order_is_fatal_and_not_charged/1]}.
+      fun invalid_order_is_fatal_and_not_charged/1,
+      fun fail_saves_failed/1]}.
 
 setup() ->
     ok = application:set_env(order_app, mnesia_copies, ram_copies),
@@ -43,6 +44,10 @@ decline_is_fatal_and_saved_failed(_) ->
     Result = order_processor:process(order()),
     [?_assertEqual({error, fatal, declined}, Result),
      ?_assertMatch({ok, #{status := failed}}, order_store:get(<<"o-1">>))].
+
+fail_saves_failed(_) ->
+    ok = order_processor:fail((order())#{attempt => 3}),
+    ?_assertMatch({ok, #{status := failed, attempt := 3}}, order_store:get(<<"o-1">>)).
 
 invalid_order_is_fatal_and_not_charged(_) ->
     ok = meck:expect(payment_gateway, charge, fun(_) -> {ok, #{}} end),

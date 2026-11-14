@@ -6,7 +6,7 @@ Orders arrive over a REST API, are published to Kafka, and are processed by supe
 
 There is no frontend. You drive it with `curl`, Postman, or a producer script.
 
-> **Status:** in progress. Phases 1–4 of 9 are done: orders flow end to end from `POST /orders` through Kafka to a stored `completed` status, and a killed consumer recovers without losing orders. Retries and duplicate protection come in phases 5–6. Until then, a gateway timeout goes straight to `orders.dlq`, and the simulated gateway's failure rates are set to 0. See [Roadmap](#roadmap).
+> **Status:** in progress. Phases 1–5 of 9 are done: orders flow end to end from `POST /orders` through Kafka to a stored status, a killed consumer recovers without losing orders, and failed payments are retried with backoff before landing on the dead-letter topic. Duplicate protection comes in phase 6; until then, a redelivered message can charge an order twice. See [Roadmap](#roadmap).
 
 ---
 
@@ -80,6 +80,8 @@ Every topic carries this JSON shape:
 ```
 
 `amount` is an integer in the smallest currency unit (paise, cents), **never a float**. The server sets `attempt` and `created_at`.
+
+Messages on `orders.retry` also carry `not_before` (Unix milliseconds). Messages on `orders.dlq` also carry `reason` (for example `"timeout"`, `"declined"`, `"invalid:amount"`) and `failed_at`.
 
 ---
 
@@ -190,7 +192,7 @@ curl localhost:8080/orders/o-1001
 #      "items":[{"sku":"SKU-1","qty":2}],"attempt":0,"created_at":"...","updated_at":1794685666388}
 ```
 
-`status` is `completed` or `failed` (payment declined). `updated_at` is Unix time in milliseconds. An order that has not been consumed yet returns `404`.
+`status` is `completed`, or `failed` (payment declined, or retries used up). `updated_at` is Unix time in milliseconds. An order that has not been processed yet, or is waiting for a retry, returns `404`.
 
 ### Validation rules
 
@@ -236,9 +238,19 @@ exit(maps:get(0, Workers), kill).
 
 The consumer group restarts within a few seconds (`consumer_worker_started` in the logs), and orders posted before, during, and after the kill all reach `completed`. `e2e_SUITE` automates this with 30 orders.
 
-### Try a failure
+### Watch a retry
 
-Set `{gateway_decline_rate, 1.0}` in `config/sys.config` and restart the app. Every order is then declined: `GET` shows `"status":"failed"`, and the order appears on `orders.dlq` with `"reason":"declined"`. A message that is not valid JSON goes to `orders.dlq` too, base64-encoded, so a bad message never blocks its partition.
+The simulated gateway times out 10% of the time and declines 2% (`gateway_timeout_rate` and `gateway_decline_rate` in `config/sys.config`). A timeout is retried after 1 s, 5 s, then 30 s. After the third retry fails, the order is marked `failed` and sent to `orders.dlq`. A decline goes to `orders.dlq` at once.
+
+To force it, make every charge time out. In the app's Erlang shell (see [Crash a worker](#crash-a-worker)):
+
+```erlang
+application:set_env(order_app, gateway_timeout_rate, 1.0).
+```
+
+Post an order. About 36 seconds later, `GET /orders/:id` shows `"status":"failed","attempt":3`, and the logs show `order_retry` with attempts 1, 2 and 3, then `order_dead_lettered` with `class: retries_exhausted`. Set the rate back to `0.1` afterwards.
+
+A message that is not valid JSON goes to `orders.dlq` too, base64-encoded, so a bad message never blocks its partition.
 
 ---
 
@@ -257,21 +269,23 @@ docker compose run --rm app rebar3 dialyzer
 docker compose run --rm app rebar3 ct --dir test/ct --suite e2e_SUITE
 ```
 
+The end-to-end suite posts its orders to the real `orders` topic under its own consumer groups. When you next start the app, its `order_consumers` group processes those test orders too. That is harmless, but expect some extra `order_completed` and `order_retry` log lines.
+
 The unit and Common Test suites do **not** need Kafka. The Kafka client, the consumer group, and the payment gateway are mocked at their edges, and Mnesia runs in RAM, so the suites run fast, give the same result every time, and leave no files behind.
 
 | Layer | Tool | Covers | Location |
 | --- | --- | --- | --- |
-| Unit | EUnit, PropEr | Validation, JSON codec (with a property-based round trip), processor outcomes, Mnesia store, simulated gateway | `test/unit/` |
-| Integration | Common Test, `meck` | HTTP API, consumer outcomes (completed, declined, timeout, invalid, poison message), `GET /orders/:id`, consumer restart after a crash; later retries, duplicates | `test/ct/` |
+| Unit | EUnit, PropEr | Validation, JSON codec (with a property-based round trip), retry policy, processor outcomes, Mnesia store, simulated gateway | `test/unit/` |
+| Integration | Common Test, `meck` | HTTP API, consumer outcomes, `GET /orders/:id`, retries (backoff, release after `not_before`, in-order commits, the full timeout-to-DLQ loop), consumer restart after a crash; later duplicates | `test/ct/` |
 | Contract | Pact message pact | Shape of the `order.created` event between producer and consumer | `test/pact/` *(phase 7)* |
-| End-to-end | Common Test | Real Kafka: an order completes; 30 orders all complete despite a worker killed mid-batch; later DLQ | `test/ct/e2e_SUITE.erl` |
+| End-to-end | Common Test | Real Kafka: an order completes; 30 orders all complete despite a worker killed mid-batch; a failing order retries three times and lands on `orders.dlq` | `test/ct/e2e_SUITE.erl` |
 
 **Current results:**
-- EUnit: 65 tests pass, including 300 generated PropEr round-trip cases.
-- Common Test: all 14 mocked cases pass (consumer suite 8, producer suite 6).
-- End-to-end: both cases pass against real Kafka.
+- EUnit: 97 tests pass, including 300 generated PropEr round-trip cases.
+- Common Test: all 19 mocked cases pass (consumer suite 13, producer suite 6).
+- End-to-end: all 3 cases pass against real Kafka.
 - Dialyzer: clean.
-- Line coverage: 88%. `order_producer` shows 0% because tests replace it with a mock; a live run against Kafka exercises it.
+- Line coverage: 84% (EUnit plus the mocked suites). The Kafka-facing code shows lower numbers, because the mocked suites stub it and the end-to-end suite exercises it: `order_producer` 0%, `consumer_worker`'s group start-up and `retry_sup`'s lookup partly.
 
 ---
 
@@ -299,6 +313,9 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 │   ├── consumer_sup.erl      supervises the brod consumer group
 │   ├── consumer_worker.erl   thin Kafka shell: decode, process, publish outcome, commit
 │   ├── order_processor.erl   business flow, returns retryable or fatal errors
+│   ├── retry_policy.erl      pure: backoff schedule and dead-letter decision
+│   ├── retry_sup.erl         supervises retry_manager and the retry consumer group
+│   ├── retry_manager.erl     holds retries until not_before, republishes, commits in order
 │   ├── payment_gateway.erl   simulated gateway with configurable failure rates
 │   ├── order_store.erl       storage behaviour, implementation chosen in config
 │   ├── order_store_mnesia.erl   Mnesia implementation
@@ -320,8 +337,10 @@ order_app
     ├── producer_sup        brod client                   ✅
     ├── consumer_sup        supervisor                    ✅
     │     └── consumer_group    brod group subscriber, one worker per partition
+    ├── retry_sup           supervisor (one_for_all)      ✅
+    │     ├── retry_manager     holds retries until not_before
+    │     └── retry_group       brod group subscriber on orders.retry
     ├── http_sup            cowboy listener               ✅
-    ├── retry_manager       delayed retries               (phase 5)
     ├── idempotency_store   Mnesia-backed                 (phase 6)
     └── metrics_server                                    (phase 9)
 ```
@@ -350,8 +369,8 @@ For the full specification, see [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTA
 | 2. API and producer | cowboy handler, validator, codec, producer | `curl POST /orders` puts a message on `orders` | ✅ |
 | 3. Basic consumer | `consumer_worker`, `order_processor`, Mnesia store | An order is consumed and `GET /orders/:id` shows `completed` | ✅ |
 | 4. Supervision | `consumer_sup`, one worker per partition, manual commits | Killing a worker restarts it and no order is lost | ✅ |
-| 5. Retry and DLQ | `retry_policy`, `retry_manager`, error classification | A failing order retries three times, then lands on `orders.dlq` | ⏳ next |
-| 6. Idempotency | `idempotency_store`, gateway idempotency key | The same order sent twice is charged once | |
+| 5. Retry and DLQ | `retry_policy`, `retry_manager`, error classification | A failing order retries three times, then lands on `orders.dlq` | ✅ |
+| 6. Idempotency | `idempotency_store`, gateway idempotency key | The same order sent twice is charged once | ⏳ next |
 | 7. Contract tests | Pact file and suites | Renaming a field on the producer fails the build | |
 | 8. PostgreSQL | `order_store_pg` behind the behaviour | Switching `store_impl` changes the store with no code change | |
 | 9. Metrics and release | Prometheus, JSON logs, `relx` release, CI | `docker compose up` starts everything and CI is green | |
