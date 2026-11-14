@@ -7,7 +7,9 @@
 -include_lib("brod/include/brod.hrl").
 
 -export([start_app/0, stop_app/0, reset/0, base_url/0, feed/1, feed_raw/2,
-         published/1, receipt/0]).
+         published/1, receipt/0, wait_until/2]).
+
+-define(POLL_INTERVAL_MS, 50).
 
 -define(MOCKS, [order_producer, consumer_worker, payment_gateway]).
 
@@ -70,6 +72,21 @@ published(Topic) ->
 
 receipt() ->
     #{order_id => <<"test">>, receipt_id => <<"r-1">>}.
+
+%% Polls Fun until it returns true, failing the test after Timeout ms.
+wait_until(Fun, Timeout) when Timeout =< 0 ->
+    case Fun() of
+        true -> ok;
+        false -> ct:fail(wait_until_timeout)
+    end;
+wait_until(Fun, Timeout) ->
+    case Fun() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(?POLL_INTERVAL_MS),  % poll interval, not a wait for an outcome
+            wait_until(Fun, Timeout - ?POLL_INTERVAL_MS)
+    end.
 
 start_stub() ->
     %% A linked process the supervisor can own and shut down.

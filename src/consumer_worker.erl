@@ -2,39 +2,73 @@
 -behaviour(brod_group_subscriber_v2).
 
 %% Thin Kafka shell: decode, call order_processor, publish the outcome, then
-%% commit. brod runs one callback process per assigned partition.
+%% commit. brod runs one callback process per assigned partition, under the
+%% group subscriber that consumer_sup supervises.
+%%
+%% Shutdown: the subscriber stops each worker with a message queued behind
+%% the one being handled, so the in-flight order finishes, and then flushes
+%% acked offsets before exiting.
 
 -include_lib("brod/include/brod.hrl").
 -include_lib("kernel/include/logger.hrl").
 -include("order_topics.hrl").
 
--export([start_link/0]).
--export([init/2, handle_message/2]).
+-export([start_link/0, partition_workers/0]).
+-export([init/2, handle_message/2, terminate/2]).
 -export_type([state/0]).
 
 -type state() :: #{topic := binary(), partition := non_neg_integer()}.
 
 -define(DEFAULT_GROUP_ID, <<"order_consumers">>).
 -define(DEFAULT_COMMIT_INTERVAL_S, 5).
+-define(DEFAULT_BEGIN_OFFSET, earliest).
+-define(DEFAULT_CALL_TIMEOUT_MS, 5000).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
     GroupId = application:get_env(order_app, consumer_group_id, ?DEFAULT_GROUP_ID),
     Interval = application:get_env(order_app, offset_commit_interval_seconds,
                                    ?DEFAULT_COMMIT_INTERVAL_S),
+    %% Only used when the group has no committed offset for a partition.
+    BeginOffset = application:get_env(order_app, consumer_begin_offset,
+                                      ?DEFAULT_BEGIN_OFFSET),
     brod_group_subscriber_v2:start_link(
       #{client => order_producer:client(),
         group_id => GroupId,
         topics => [?TOPIC_ORDERS],
         cb_module => ?MODULE,
         message_type => message,
-        consumer_config => [{begin_offset, earliest}],
+        consumer_config => [{begin_offset, BeginOffset}],
         group_config => [{offset_commit_policy, commit_to_kafka_v2},
                          {offset_commit_interval_seconds, Interval}]}).
 
+%% Partition number to the pid of the process consuming it. Used by tests
+%% and the crash-recovery demo.
+-spec partition_workers() -> {ok, #{non_neg_integer() => pid()}} | {error, term()}.
+partition_workers() ->
+    workers(consumer_sup:subscriber()).
+
+workers({ok, Subscriber}) ->
+    Timeout = application:get_env(order_app, call_timeout_ms, ?DEFAULT_CALL_TIMEOUT_MS),
+    %% brod 4.7 exports only get_workers/1, which waits forever. This is the
+    %% same request its unexported get_workers/2 makes, with a bounded timeout.
+    try gen_server:call(Subscriber, get_workers, Timeout) of
+        Workers -> {ok, maps:from_list([{P, Pid} || {{_Topic, P}, Pid} <- maps:to_list(Workers)])}
+    catch
+        exit:{timeout, _} -> {error, timeout}
+    end;
+workers({error, _} = Error) ->
+    Error.
+
 -spec init(brod_group_subscriber_v2:init_info(), term()) -> {ok, state()}.
 init(#{topic := Topic, partition := Partition}, _CbConfig) ->
+    ?LOG_INFO(#{event => consumer_worker_started, topic => Topic, partition => Partition}),
     {ok, #{topic => Topic, partition => Partition}}.
+
+-spec terminate(term(), state()) -> ok.
+terminate(Reason, #{topic := Topic, partition := Partition}) ->
+    ?LOG_INFO(#{event => consumer_worker_stopped, topic => Topic,
+                partition => Partition, reason => Reason}).
 
 %% Returns commit only after the outcome is published. If anything crashes
 %% first, the offset is not committed and the message is redelivered.

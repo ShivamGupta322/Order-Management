@@ -1,7 +1,7 @@
 {application, order_app,
  [{description, "Fault-tolerant, event-driven order processing backend"},
   {vsn, "0.1.0"},
-  {registered, [order_sup]},
+  {registered, [order_sup, consumer_sup]},
   {mod, {order_app, []}},
   {applications, [kernel, stdlib, jsx, ranch, cowboy, brod]},
   {env, []},

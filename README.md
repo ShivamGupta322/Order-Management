@@ -6,7 +6,7 @@ Orders arrive over a REST API, are published to Kafka, and are processed by supe
 
 There is no frontend. You drive it with `curl`, Postman, or a producer script.
 
-> **Status:** in progress. Phases 1–3 of 9 are done: orders flow end to end from `POST /orders` through Kafka to a stored `completed` status. Retries, duplicate protection, and crash-recovery tests come in phases 4–6. Until then, a gateway timeout goes straight to `orders.dlq`, and the simulated gateway's failure rates are set to 0. See [Roadmap](#roadmap).
+> **Status:** in progress. Phases 1–4 of 9 are done: orders flow end to end from `POST /orders` through Kafka to a stored `completed` status, and a killed consumer recovers without losing orders. Retries and duplicate protection come in phases 5–6. Until then, a gateway timeout goes straight to `orders.dlq`, and the simulated gateway's failure rates are set to 0. See [Roadmap](#roadmap).
 
 ---
 
@@ -51,7 +51,7 @@ flowchart LR
 
 - **At-least-once delivery** from Kafka, with **manual offset commits** only after an order is saved, retried, or dead-lettered.
 - **Idempotent processing** on top, so a redelivered message does not create a duplicate. The result is effectively exactly once, without Kafka transactions.
-- **One supervised worker per partition**, so a crash affects one partition only and the worker restarts from the last committed offset.
+- **One worker process per partition**, so partitions are processed in parallel. If a worker crashes, the consumer group restarts under its supervisor and every partition resumes from its last committed offset. No order is lost, at the cost of a pause of a few seconds.
 - **No worker ever sleeps on a failed order.** It hands the order to the retry topic and moves on, so one bad order cannot block a partition.
 
 ### Kafka topics
@@ -225,6 +225,17 @@ MSYS_NO_PATHCONV=1 docker compose exec kafka /opt/kafka/bin/kafka-consumer-group
   --bootstrap-server localhost:9092 --describe --group order_consumers
 ```
 
+### Crash a worker
+
+Attach to the running app (`docker attach ordermanagement-app-1`, detach with `Ctrl-P Ctrl-Q`), or start it with `docker compose run --rm --service-ports app rebar3 shell --sname order_processing`. Then, in the Erlang shell:
+
+```erlang
+{ok, Workers} = consumer_worker:partition_workers().   % #{0 => Pid0, 1 => Pid1, 2 => Pid2}
+exit(maps:get(0, Workers), kill).
+```
+
+The consumer group restarts within a few seconds (`consumer_worker_started` in the logs), and orders posted before, during, and after the kill all reach `completed`. `e2e_SUITE` automates this with 30 orders.
+
 ### Try a failure
 
 Set `{gateway_decline_rate, 1.0}` in `config/sys.config` and restart the app. Every order is then declined: `GET` shows `"status":"failed"`, and the order appears on `orders.dlq` with `"reason":"declined"`. A message that is not valid JSON goes to `orders.dlq` too, base64-encoded, so a bad message never blocks its partition.
@@ -241,6 +252,9 @@ docker compose run --rm app rebar3 eunit --cover
 docker compose run --rm app rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE --cover
 docker compose run --rm app rebar3 cover --verbose     # coverage summary
 docker compose run --rm app rebar3 dialyzer
+
+# End-to-end against real Kafka (not in the default run; skips itself if Kafka is down)
+docker compose run --rm app rebar3 ct --dir test/ct --suite e2e_SUITE
 ```
 
 The unit and Common Test suites do **not** need Kafka. The Kafka client, the consumer group, and the payment gateway are mocked at their edges, and Mnesia runs in RAM, so the suites run fast, give the same result every time, and leave no files behind.
@@ -248,13 +262,14 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 | Layer | Tool | Covers | Location |
 | --- | --- | --- | --- |
 | Unit | EUnit, PropEr | Validation, JSON codec (with a property-based round trip), processor outcomes, Mnesia store, simulated gateway | `test/unit/` |
-| Integration | Common Test, `meck` | HTTP API, consumer outcomes (completed, declined, timeout, invalid, poison message), `GET /orders/:id`; later supervision, retries, duplicates | `test/ct/` |
+| Integration | Common Test, `meck` | HTTP API, consumer outcomes (completed, declined, timeout, invalid, poison message), `GET /orders/:id`, consumer restart after a crash; later retries, duplicates | `test/ct/` |
 | Contract | Pact message pact | Shape of the `order.created` event between producer and consumer | `test/pact/` *(phase 7)* |
-| End-to-end | Common Test | Real Kafka: post, crash a worker, assert every order completes | `test/ct/e2e_SUITE.erl` *(phase 9)* |
+| End-to-end | Common Test | Real Kafka: an order completes; 30 orders all complete despite a worker killed mid-batch; later DLQ | `test/ct/e2e_SUITE.erl` |
 
 **Current results:**
 - EUnit: 65 tests pass, including 300 generated PropEr round-trip cases.
-- Common Test: all 13 cases pass (consumer suite 7, producer suite 6).
+- Common Test: all 14 mocked cases pass (consumer suite 8, producer suite 6).
+- End-to-end: both cases pass against real Kafka.
 - Dialyzer: clean.
 - Line coverage: 88%. `order_producer` shows 0% because tests replace it with a mock; a live run against Kafka exercises it.
 
@@ -281,6 +296,7 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 │   ├── order_validator.erl   pure: field and amount checks
 │   ├── order_codec.erl       pure: JSON encode and decode, DLQ messages
 │   ├── order_producer.erl    the only module that publishes to Kafka
+│   ├── consumer_sup.erl      supervises the brod consumer group
 │   ├── consumer_worker.erl   thin Kafka shell: decode, process, publish outcome, commit
 │   ├── order_processor.erl   business flow, returns retryable or fatal errors
 │   ├── payment_gateway.erl   simulated gateway with configurable failure rates
@@ -302,14 +318,15 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 order_app
 └── order_sup (one_for_one)
     ├── producer_sup        brod client                   ✅
-    ├── consumer_sup        one worker per partition      ✅ basic; crash-recovery tests in phase 4
+    ├── consumer_sup        supervisor                    ✅
+    │     └── consumer_group    brod group subscriber, one worker per partition
     ├── http_sup            cowboy listener               ✅
     ├── retry_manager       delayed retries               (phase 5)
     ├── idempotency_store   Mnesia-backed                 (phase 6)
     └── metrics_server                                    (phase 9)
 ```
 
-Children start in the order shown and stop in reverse. On shutdown, HTTP stops first, then the consumers, then the producer they both depend on.
+Children start in the order shown and stop in reverse. On shutdown, HTTP stops first, then the consumers, then the producer they both depend on. Each partition worker finishes the order it is handling before it stops, and acked offsets are committed on the way out.
 
 ---
 
@@ -332,8 +349,8 @@ For the full specification, see [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTA
 | 1. Setup | `rebar3` app, Docker Compose, topics script | Kafka runs and the app boots | ✅ |
 | 2. API and producer | cowboy handler, validator, codec, producer | `curl POST /orders` puts a message on `orders` | ✅ |
 | 3. Basic consumer | `consumer_worker`, `order_processor`, Mnesia store | An order is consumed and `GET /orders/:id` shows `completed` | ✅ |
-| 4. Supervision | `consumer_sup`, one worker per partition, manual commits | Killing a worker restarts it and no order is lost | ⏳ next |
-| 5. Retry and DLQ | `retry_policy`, `retry_manager`, error classification | A failing order retries three times, then lands on `orders.dlq` | |
+| 4. Supervision | `consumer_sup`, one worker per partition, manual commits | Killing a worker restarts it and no order is lost | ✅ |
+| 5. Retry and DLQ | `retry_policy`, `retry_manager`, error classification | A failing order retries three times, then lands on `orders.dlq` | ⏳ next |
 | 6. Idempotency | `idempotency_store`, gateway idempotency key | The same order sent twice is charged once | |
 | 7. Contract tests | Pact file and suites | Renaming a field on the producer fails the build | |
 | 8. PostgreSQL | `order_store_pg` behind the behaviour | Switching `store_impl` changes the store with no code change | |

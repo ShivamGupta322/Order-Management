@@ -83,18 +83,23 @@ Use 3 partitions per topic for local development, and key every message by order
 ```
 order_app
 └── order_sup (one_for_one)
+    ├── producer_sup        brod client, shared by producer and consumers
+    ├── consumer_sup        supervisor
+    │     └── consumer_group    brod_group_subscriber_v2
+    │           ├── worker for partition 0   (consumer_worker callbacks)
+    │           ├── worker for partition 1
+    │           └── worker for partition 2
     ├── http_sup            cowboy listener
-    ├── producer_sup        brod producer client
-    ├── consumer_sup        one worker per partition
-    │     ├── consumer_worker_0
-    │     ├── consumer_worker_1
-    │     └── consumer_worker_2
     ├── retry_manager       gen_server for delayed retries
     ├── idempotency_store   Mnesia-backed
     └── metrics_server
 ```
 
-Each worker owns one partition, so a crash affects one partition only and the supervisor restarts it from the last committed offset.
+Children start top to bottom and stop in reverse. On shutdown, HTTP stops first, then the consumers, then the producer they depend on.
+
+Each partition has its own worker process, so partitions are processed in parallel and in order within each partition. The partition workers are owned by brod's group subscriber, not directly by `consumer_sup`.
+
+When any partition worker crashes, the subscriber flushes the offsets already acked, stops its other workers, and exits. `consumer_sup` restarts it, the member rejoins the group, and **every** partition resumes from its last committed offset. No order is lost. The crashed partition's in-flight message is redelivered, and the other partitions pause for a few seconds during the rejoin. This was chosen over per-partition supervisors (which would need offsets kept outside Kafka) to keep Kafka consumer groups and their tooling. `consumer_worker:partition_workers/0` returns the worker pid for each partition.
 
 ### Modules
 
@@ -290,9 +295,9 @@ There is a real gap here to be honest about: a crash after `charge` succeeds but
 
 ### Graceful shutdown
 
-- Workers set `process_flag(trap_exit, true)` and finish the in-flight order in `terminate/2`.
-- Give worker child specs a `shutdown` value of about 10000 ms instead of `brutal_kill`.
-- On `SIGTERM` the release stops the application in order: HTTP listener first, then consumers, then the producer.
+- The group subscriber traps exits. In `terminate/2` it stops each partition worker with a message queued behind the order being handled, so the in-flight order finishes, and then it flushes offset commits. `consumer_worker:terminate/2` logs `consumer_worker_stopped`.
+- Child specs get a `shutdown` value (`consumer_shutdown_ms`, `producer_shutdown_ms`, both 10000 ms by default) instead of `brutal_kill`.
+- On `SIGTERM` the VM stops the application in reverse start order: HTTP listener first, then consumers, then the producer.
 
 ## Project setup
 
@@ -527,9 +532,11 @@ The guide's sample code uses `timer:sleep` (once in the duplicate case, and insi
 
 One suite runs against the real Kafka from Docker Compose and is kept out of the default run:
 
-- [ ] Post an order, then poll `GET /orders/:id` until it reads `completed`
-- [ ] Kill a worker mid-run and assert every posted order still completes
+- [x] Post an order, then poll `GET /orders/:id` until it reads `completed`
+- [x] Kill a worker mid-run and assert every posted order still completes
 - [ ] Force failures and assert the order appears on `orders.dlq`
+
+`e2e_SUITE` skips itself if Kafka is unreachable. Each run uses a fresh consumer group starting at `latest`, so history is not replayed. `latest` only applies to a partition with no committed offset, and a restart before a partition's first commit would skip messages that arrived meanwhile. So the suite first sends one order to each partition and waits until the group has committed on all three.
 
 ### Pact contract tests
 

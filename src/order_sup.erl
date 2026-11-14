@@ -6,8 +6,7 @@
 
 -define(HTTP_LISTENER, order_http).
 -define(DEFAULT_HTTP_PORT, 8080).
--define(PRODUCER_SHUTDOWN_MS, 10000).
--define(CONSUMER_SHUTDOWN_MS, 10000).
+-define(DEFAULT_PRODUCER_SHUTDOWN_MS, 10000).
 
 -spec start_link() -> supervisor:startlink_ret().
 start_link() ->
@@ -26,15 +25,17 @@ producer_spec() ->
     #{id => producer_sup,
       start => {order_producer, start_link, []},
       restart => permanent,
-      shutdown => ?PRODUCER_SHUTDOWN_MS,
+      shutdown => application:get_env(order_app, producer_shutdown_ms,
+                                      ?DEFAULT_PRODUCER_SHUTDOWN_MS),
       type => worker}.
 
 consumer_spec() ->
     #{id => consumer_sup,
-      start => {consumer_worker, start_link, []},
+      start => {consumer_sup, start_link, []},
       restart => permanent,
-      shutdown => ?CONSUMER_SHUTDOWN_MS,
-      type => worker}.
+      %% consumer_sup bounds its own child's shutdown time.
+      shutdown => infinity,
+      type => supervisor}.
 
 http_spec() ->
     Port = application:get_env(order_app, http_port, ?DEFAULT_HTTP_PORT),

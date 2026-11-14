@@ -10,7 +10,8 @@ all() ->
      invalid_order_goes_to_dlq_without_charging,
      poison_message_goes_to_dlq_and_commits,
      get_order_returns_stored_order,
-     get_unknown_order_returns_404].
+     get_unknown_order_returns_404,
+     worker_restarts_after_crash].
 
 init_per_suite(Config) ->
     ok = order_test_helper:start_app(),
@@ -85,6 +86,30 @@ get_order_returns_stored_order(_Config) ->
 
 get_unknown_order_returns_404(_Config) ->
     ?assertEqual({404, #{<<"error">> => <<"not_found">>}}, http_get("/orders/nope")).
+
+%% Supervision wiring: consumer_sup restarts the consumer and nothing else in
+%% the app is touched. That no order is lost is proven against real Kafka in
+%% e2e_SUITE:killed_worker_loses_no_orders.
+worker_restarts_after_crash(_Config) ->
+    Siblings = supervisor:which_children(order_sup) -- [consumer_child()],
+    {ok, Pid} = consumer_sup:subscriber(),
+    Ref = erlang:monitor(process, Pid),
+    exit(Pid, kill),
+    receive {'DOWN', Ref, process, Pid, killed} -> ok after 2000 -> ct:fail(no_down) end,
+    ok = order_test_helper:wait_until(
+           fun() ->
+                   case consumer_sup:subscriber() of
+                       {ok, New} -> New =/= Pid;
+                       {error, not_running} -> false
+                   end
+           end, 5000),
+    ?assertEqual(Siblings, supervisor:which_children(order_sup) -- [consumer_child()]),
+    %% The app still serves traffic.
+    {ok, commit, _} = order_test_helper:feed(order(<<"o-6">>)),
+    ?assertMatch({200, #{<<"status">> := <<"completed">>}}, http_get("/orders/o-6")).
+
+consumer_child() ->
+    lists:keyfind(consumer_sup, 1, supervisor:which_children(order_sup)).
 
 %%--------------------------------------------------------------------
 
