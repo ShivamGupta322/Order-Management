@@ -1,0 +1,10 @@
+{application, order_app,
+ [{description, "Fault-tolerant, event-driven order processing backend"},
+  {vsn, "0.1.0"},
+  {registered, [order_sup]},
+  {mod, {order_app, []}},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, []},
+  {licenses, []},
+  {links, []}]}.

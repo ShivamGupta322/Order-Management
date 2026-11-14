@@ -1,0 +1,7 @@
+## Mnesia disc_copies (phase 3) need a stable node name.
+-sname order_processing
+
+## Cookie is deliberately not set here; the release uses ~/.erlang.cookie.
+
++K true
++A 30
