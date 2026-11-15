@@ -3,7 +3,7 @@
 %% JSON encode/decode of order events. Pure: no processes, no I/O.
 
 -export([encode/1, decode/1, encode_retry/2, decode_retry/1,
-         encode_dead_letter/3, encode_dead_letter_raw/3]).
+         encode_dead_letter/3, encode_dead_letter_raw/3, format_reason/1]).
 -export_type([order/0, item/0, decode_error/0]).
 
 -type item() :: #{sku => binary(), qty => integer()}.
@@ -54,7 +54,7 @@ retry_from_json(Other) ->
 -spec encode_dead_letter(map(), reason(), FailedAt :: binary()) -> binary().
 encode_dead_letter(Order, Reason, FailedAt) ->
     jsx:encode(Order#{attempt => maps:get(attempt, Order, 0),
-                      reason => reason_to_binary(Reason),
+                      reason => format_reason(Reason),
                       failed_at => FailedAt}).
 
 %% An undecodable message has no order to carry, so the raw bytes travel
@@ -62,12 +62,14 @@ encode_dead_letter(Order, Reason, FailedAt) ->
 -spec encode_dead_letter_raw(binary(), reason(), FailedAt :: binary()) -> binary().
 encode_dead_letter_raw(Raw, Reason, FailedAt) ->
     jsx:encode(#{raw_base64 => base64:encode(Raw),
-                 reason => reason_to_binary(Reason),
+                 reason => format_reason(Reason),
                  failed_at => FailedAt}).
 
-reason_to_binary(Reason) when is_atom(Reason) ->
+%% The `reason' string of a DLQ message, also used as the orders_dlq_total label.
+-spec format_reason(reason()) -> binary().
+format_reason(Reason) when is_atom(Reason) ->
     atom_to_binary(Reason);
-reason_to_binary({Kind, Field}) when is_atom(Kind), is_atom(Field) ->
+format_reason({Kind, Field}) when is_atom(Kind), is_atom(Field) ->
     <<(atom_to_binary(Kind))/binary, ":", (atom_to_binary(Field))/binary>>.
 
 %% Decoding only maps structure; field values are checked by order_validator.

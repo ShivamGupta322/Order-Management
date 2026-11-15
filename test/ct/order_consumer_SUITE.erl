@@ -18,7 +18,8 @@ all() ->
      get_unknown_order_returns_404,
      worker_restarts_after_crash,
      duplicate_order_processed_once,
-     charge_is_replayed_after_crash_before_mark].
+     charge_is_replayed_after_crash_before_mark,
+     metrics_count_outcomes_where_they_happen].
 
 init_per_suite(Config) ->
     ok = order_test_helper:start_app(),
@@ -199,6 +200,34 @@ charge_is_replayed_after_crash_before_mark(_Config) ->
     ?assert(idempotency_store:seen(<<"crash-1">>)),
     ok = application:unset_env(order_app, gateway_timeout_rate),
     ok = application:unset_env(order_app, gateway_decline_rate).
+
+%% Each outcome moves its own counter; the duration histogram counts every
+%% message handled from the orders topic.
+metrics_count_outcomes_where_they_happen(_Config) ->
+    M = fun order_test_helper:metric/2,
+    Before = {M(orders_processed_total, [completed]), M(orders_processed_total, [failed]),
+              M(orders_processed_total, [duplicate]), M(orders_retried_total, [<<"1">>]),
+              M(orders_dlq_total, [<<"declined">>]), M(orders_dlq_total, [<<"malformed_json">>]),
+              histogram_count()},
+    {ok, commit, _} = order_test_helper:feed(order(<<"m-1">>)),          % completed
+    {ok, commit, _} = order_test_helper:feed(order(<<"m-1">>)),          % duplicate
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {error, timeout} end),
+    {ok, commit, _} = order_test_helper:feed(order(<<"m-2">>)),          % retried, attempt 1
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {error, declined} end),
+    {ok, commit, _} = order_test_helper:feed(order(<<"m-3">>)),          % failed, declined
+    {ok, commit, _} = order_test_helper:feed_raw(<<"m-4">>, <<"nope">>), % failed, malformed
+    {C, F, D, R, Dec, Mal, H} = Before,
+    ?assertEqual({C + 1, F + 2, D + 1, R + 1, Dec + 1, Mal + 1, H + 5},
+                 {M(orders_processed_total, [completed]), M(orders_processed_total, [failed]),
+                  M(orders_processed_total, [duplicate]), M(orders_retried_total, [<<"1">>]),
+                  M(orders_dlq_total, [<<"declined">>]), M(orders_dlq_total, [<<"malformed_json">>]),
+                  histogram_count()}).
+
+histogram_count() ->
+    case prometheus_histogram:value(order_processing_duration_seconds) of
+        undefined -> 0;
+        {Buckets, _Sum} -> lists:sum(Buckets)
+    end.
 
 %% Supervision wiring: consumer_sup restarts the consumer and nothing else in
 %% the app is touched. That no order is lost is proven against real Kafka in

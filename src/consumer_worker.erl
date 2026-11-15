@@ -97,7 +97,9 @@ handle_message(#kafka_message{offset = Offset, key = Key, value = Value},
     handle(Role, Value, Meta, State).
 
 handle(orders, Value, Meta, State) ->
-    ok = process(order_codec:decode(Value), Value, Meta),
+    ok = prometheus_histogram:observe_duration(
+           order_processing_duration_seconds,
+           fun() -> process(order_codec:decode(Value), Value, Meta) end),
     {ok, commit, State};
 handle(retry, Value, Meta, #{commit := Commit} = State) ->
     Entry = retry_entry(order_codec:decode_retry(Value), Value, Meta),
@@ -115,9 +117,11 @@ process({error, Reason}, Value, Meta) ->
 
 route({ok, duplicate}, _Order, _Value, Meta) ->
     %% Already completed or failed: skip and commit, publish nothing.
+    prometheus_counter:inc(orders_processed_total, [duplicate]),
     ?LOG_INFO(Meta#{event => order_duplicate});
 route({ok, _Receipt}, _Order, Value, #{order_id := Key} = Meta) ->
     ok = order_producer:publish(?TOPIC_COMPLETED, Key, Value),
+    prometheus_counter:inc(orders_processed_total, [completed]),
     ?LOG_INFO(Meta#{event => order_completed});
 route({error, retryable, Reason}, Order, _Value, Meta) ->
     Delays = application:get_env(order_app, retry_delays_ms, retry_policy:default_delays()),
@@ -130,6 +134,7 @@ retry_or_give_up({retry, Delay}, Order, Reason, #{order_id := Key} = Meta) ->
     NotBefore = order_clock:now_ms() + Delay,
     Payload = order_codec:encode_retry(Order#{attempt => Next}, NotBefore),
     ok = order_producer:publish(?TOPIC_RETRY, Key, Payload),
+    prometheus_counter:inc(orders_retried_total, [integer_to_binary(Next)]),
     ?LOG_WARNING(Meta#{event => order_retry, attempt => Next, delay_ms => Delay,
                        reason => Reason});
 retry_or_give_up(dead_letter, Order, Reason, Meta) ->
@@ -140,8 +145,12 @@ retry_or_give_up(dead_letter, Order, Reason, Meta) ->
 attempt(Order) ->
     maps:get(attempt, Order, 0).
 
+%% Every orders-role dead letter is a final failure: declined, invalid,
+%% undecodable, or out of retries.
 dead_letter(Payload, Reason, #{order_id := Key} = Meta) ->
     ok = order_producer:publish(?TOPIC_DLQ, Key, Payload),
+    prometheus_counter:inc(orders_dlq_total, [order_codec:format_reason(Reason)]),
+    prometheus_counter:inc(orders_processed_total, [failed]),
     ?LOG_ERROR(Meta#{event => order_dead_lettered, reason => Reason}).
 
 %%-- retry -----------------------------------------------------------
@@ -151,6 +160,7 @@ retry_entry({ok, Order, NotBefore}, _Value, Meta) ->
 retry_entry({error, Reason}, Value, Meta) ->
     %% Dead-lettered through retry_manager rather than here, so it is
     %% committed in offset order with the retries queued before it.
+    prometheus_counter:inc(orders_dlq_total, [order_codec:format_reason(Reason)]),
     ?LOG_ERROR(Meta#{event => order_dead_lettered, reason => Reason}),
     entry(?TOPIC_DLQ, raw_dead_letter(Value, Reason), 0, Meta).
 

@@ -6,7 +6,16 @@ Orders arrive over a REST API, are published to Kafka, and are processed by supe
 
 There is no frontend. You drive it with `curl`, Postman, or a producer script.
 
-> **Status:** in progress. Phases 1–8 of 9 are done: orders flow end to end from `POST /orders` through Kafka into PostgreSQL, a killed consumer recovers without losing orders, failed payments are retried with backoff before landing on the dead-letter topic, a duplicate or redelivered order is never charged twice, and a contract test fails the build if the producer changes the event shape. Metrics, the release, and CI come in phase 9. See [Roadmap](#roadmap).
+> **Status:** all 9 phases are built, and `docker compose up` starts the whole system:
+>
+> - Orders flow end to end from `POST /orders` through Kafka into PostgreSQL.
+> - A killed consumer recovers without losing orders.
+> - Failed payments are retried with backoff before landing on the dead-letter topic.
+> - A duplicate or redelivered order is never charged twice.
+> - A contract test fails the build if the producer changes the event shape.
+> - Prometheus metrics and JSON logs show what is happening.
+>
+> See [Roadmap](#roadmap).
 
 ---
 
@@ -18,6 +27,7 @@ There is no frontend. You drive it with `curl`, Postman, or a producer script.
 - [Quick start](#quick-start)
 - [Using the API](#using-the-api)
 - [Running the tests](#running-the-tests)
+- [Load test](#load-test)
 - [Project layout](#project-layout)
 - [Design principles](#design-principles)
 - [Roadmap](#roadmap)
@@ -97,7 +107,8 @@ Messages on `orders.retry` also carry `not_before` (Unix milliseconds). Messages
 | System of record | PostgreSQL through `epgsql`: orders and their status history |
 | Metrics | `prometheus.erl` (phase 9) |
 | Tests | EUnit, PropEr, Common Test, `meck`, Pact |
-| Infrastructure | Docker Compose: Kafka 3.9 (KRaft, no ZooKeeper), PostgreSQL 16 |
+| Infrastructure | Docker Compose: Kafka 3.9 (KRaft, no ZooKeeper), PostgreSQL 16, Prometheus |
+| Release | `relx` release in a slim Debian image; GitHub Actions CI |
 
 ---
 
@@ -116,49 +127,53 @@ You do **not** need Erlang or `rebar3` on your machine. All Erlang code builds a
 ## Quick start
 
 ```bash
-# 1. Clone
 git clone https://github.com/ShivamGupta322/order-processing
 cd order-processing
-
-# 2. Start Kafka and PostgreSQL
 docker compose up -d
-
-# 3. Create the four topics, once Kafka reports healthy (about 30 s)
-docker compose ps                 # wait for kafka: "(healthy)"
-./scripts/create_topics.sh        # on Windows, run from Git Bash
-
-# 4. Build the dev image and start the app (interactive Erlang shell on :8080)
-docker compose run --rm --service-ports app rebar3 shell --sname order_processing
 ```
 
-The `--sname` matters: Mnesia stores orders on disk under the node name (`order_processing@app`), so the name must stay the same between runs.
+That one command does everything:
 
-The first run downloads and compiles dependencies, which takes a few minutes. Later runs are fast, because build output and the package cache live in Docker volumes.
+- builds the release image
+- starts Kafka and PostgreSQL
+- creates the four topics (`kafka-init`, a one-shot service)
+- starts the app release (`orders`) once its dependencies are healthy
+- starts Prometheus
 
-To run the app in the background instead:
-
-```bash
-docker compose --profile dev up -d app
-docker compose logs -f app        # follow the logs
-docker compose stop app           # stop it
-```
-
-Check that it is up:
+The first build takes a few minutes. Then:
 
 ```bash
 curl localhost:8080/health
 # {"status":"ok"}
+docker compose logs -f orders     # JSON log lines
 ```
 
-### Stopping everything
+Prometheus is at <http://localhost:9090> (try the query `orders_processed_total`).
+
+### Stopping
 
 ```bash
-docker compose --profile dev down
+docker compose down               # add --profile dev if the dev container is running
 ```
 
-> Kafka has no data volume, so topics are lost when its container is removed or recreated. Run `./scripts/create_topics.sh` again after `down`. The script is safe to re-run.
+`docker compose stop` sends SIGTERM. The app stops its HTTP listener first, lets each partition worker finish its in-flight order, commits offsets, then exits.
+
+> Kafka has no data volume, so topics are lost when its container is removed. `kafka-init` recreates them on the next `up`.
 >
-> Orders (in the `pg_data` volume) and idempotency keys (in the `mnesia_data` volume) survive `down`. To wipe both, run `docker compose --profile dev down -v`. That also deletes the build cache volumes, so the next start recompiles. Wipe them together: keeping the idempotency keys while losing the orders would make re-sent orders look like duplicates of orders that no longer exist.
+> Orders (in the `pg_data` volume) and idempotency keys (in the `mnesia_data` volume) survive `down`. To wipe both, run `docker compose --profile dev down -v`. That also deletes the build cache volumes. Wipe them together: keeping the idempotency keys while losing the orders would make re-sent orders look like duplicates of orders that no longer exist.
+
+### Development workflow
+
+For working on the code, use the dev container instead of the release. It mounts your checkout and runs `rebar3 shell`:
+
+```bash
+docker compose up -d kafka postgres kafka-init     # infrastructure and topics only
+docker compose run --rm --service-ports app rebar3 shell --sname order_processing
+```
+
+Do not run the dev container and the `orders` release at the same time. They share port 8080, the node name, and the Mnesia volume. `docker compose stop orders` first.
+
+The `--sname` matters: Mnesia stores data on disk under the node name (`order_processing@app`), so the name must stay the same between runs. Build output and the package cache live in Docker volumes, so only the first run compiles everything.
 
 ---
 
@@ -168,7 +183,7 @@ docker compose --profile dev down
 | --- | --- | --- |
 | `POST /orders` | Validate and publish an order | `202` with order ID; `400` invalid body; `413` body too large; `503` Kafka unavailable |
 | `GET /orders/:id` | Current order status | `200` with order; `404` unknown or not yet processed |
-| `GET /metrics` | Prometheus scrape endpoint | `200` *(phase 9)* |
+| `GET /metrics` | Prometheus scrape endpoint | `200` |
 | `GET /health` | Liveness check | `200` |
 
 `POST /orders` returns **`202 Accepted`**, not `201 Created`, because processing happens asynchronously after the event is published.
@@ -248,13 +263,40 @@ MSYS_NO_PATHCONV=1 docker compose exec kafka /opt/kafka/bin/kafka-consumer-group
   --bootstrap-server localhost:9092 --describe --group order_consumers
 ```
 
+### Watch the metrics
+
+```bash
+curl -s localhost:8080/metrics | grep -E '^orders_|^order_processing'
+```
+
+| Metric | Type | Labels | Incremented when |
+| --- | --- | --- | --- |
+| `orders_received_total` | counter | none | `POST /orders` publishes an order |
+| `orders_processed_total` | counter | `result`: completed, failed, duplicate | an order reaches an outcome |
+| `orders_retried_total` | counter | `attempt` | an order goes to `orders.retry` |
+| `orders_dlq_total` | counter | `reason` | a message goes to `orders.dlq` |
+| `order_processing_duration_seconds` | histogram | none | a message from `orders` is handled |
+
+Logs are one JSON object per line, with `order_id`, `partition`, and `offset` as fields:
+
+```json
+{"attempt":1,"delay_ms":1000,"event":"order_retry","level":"warning","mfa":"consumer_worker:retry_or_give_up/4","offset":166,"order_id":"o-rel-1","partition":0,"reason":"timeout","time":"2026-11-15T12:53:00.695074Z"}
+```
+
+### Run code in the live app
+
+The demos below run Erlang inside the app. With the release running (`docker compose up`), use its `eval` command:
+
+```bash
+MSYS_NO_PATHCONV=1 docker compose exec orders bin/order_processing eval '<expression>.'
+```
+
+With the dev container, type the expression into its `rebar3 shell` instead.
+
 ### Crash a worker
 
-Attach to the running app (`docker attach ordermanagement-app-1`, detach with `Ctrl-P Ctrl-Q`), or start it with `docker compose run --rm --service-ports app rebar3 shell --sname order_processing`. Then, in the Erlang shell:
-
 ```erlang
-{ok, Workers} = consumer_worker:partition_workers().   % #{0 => Pid0, 1 => Pid1, 2 => Pid2}
-exit(maps:get(0, Workers), kill).
+{ok, #{0 := Worker}} = consumer_worker:partition_workers(orders), exit(Worker, kill).
 ```
 
 The consumer group restarts within a few seconds (`consumer_worker_started` in the logs), and orders posted before, during, and after the kill all reach `completed`. `e2e_SUITE` automates this with 30 orders.
@@ -263,7 +305,7 @@ The consumer group restarts within a few seconds (`consumer_worker_started` in t
 
 The simulated gateway times out 10% of the time and declines 2% (`gateway_timeout_rate` and `gateway_decline_rate` in `config/sys.config`). A timeout is retried after 1 s, 5 s, then 30 s. After the third retry fails, the order is marked `failed` and sent to `orders.dlq`. A decline goes to `orders.dlq` at once.
 
-To force it, make every charge time out. In the app's Erlang shell (see [Crash a worker](#crash-a-worker)):
+To force it, make every charge time out (see [Run code in the live app](#run-code-in-the-live-app)):
 
 ```erlang
 application:set_env(order_app, gateway_timeout_rate, 1.0).
@@ -283,7 +325,7 @@ The simulated gateway also treats the order ID as an idempotency key. Say the wo
 
 ## Running the tests
 
-Run every command inside the app container, with Kafka and PostgreSQL up (`docker compose up -d`):
+Run every command inside the dev container, with Kafka and PostgreSQL up (`docker compose up -d kafka postgres kafka-init`):
 
 ```bash
 docker compose run --rm app rebar3 compile
@@ -294,9 +336,13 @@ docker compose run --rm app rebar3 ct --dir test/ct --suite order_store_SUITE   
 docker compose run --rm app rebar3 cover --verbose     # coverage summary
 docker compose run --rm app rebar3 dialyzer
 
-# End-to-end against real Kafka (not in the default run; skips itself if Kafka is down)
+# End-to-end against real Kafka and PostgreSQL (not in the default run; skips itself
+# if Kafka is down). Stop the release first: it would consume the same test orders.
+docker compose stop orders
 docker compose run --rm app rebar3 ct --dir test/ct --suite e2e_SUITE
 ```
+
+**CI.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs every push and pull request in the same `erlang:28.4.2` image, with a PostgreSQL service container. It runs compile, EUnit, the mocked Common Test suites, the store contract suite, the Pact suites, and Dialyzer. It also checks that the regenerated pact file matches the committed one. The end-to-end suite is left out, because it needs Kafka.
 
 The end-to-end suite posts its orders to the real `orders` topic under its own consumer groups. When you next start the app, its `order_consumers` group processes those test orders too. That is harmless, but expect some extra `order_completed` and `order_retry` log lines.
 
@@ -311,13 +357,38 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 | End-to-end | Common Test | Real Kafka and PostgreSQL: an order completes; 30 orders all complete despite a worker killed mid-batch; a failing order retries three times and lands on `orders.dlq`; an order posted twice completes once | `test/ct/e2e_SUITE.erl` |
 
 **Current results:**
-- EUnit: 151 tests pass, including 300 generated PropEr round-trip cases.
-- Common Test: all 21 mocked cases pass (consumer suite 15, producer suite 6).
+- EUnit: 158 tests pass, including 300 generated PropEr round-trip cases.
+- Common Test: all 24 mocked cases pass (consumer suite 16, producer suite 8).
 - Contract: all 6 Pact cases pass. A deliberate rename of `amount` to `total` in the producer makes them fail, as intended.
 - Store contract: all 15 cases pass (Mnesia 7, PostgreSQL 8).
 - End-to-end: all 4 cases pass against real Kafka and PostgreSQL.
 - Dialyzer: clean.
-- Line coverage: 84% at phase 5 (EUnit plus the mocked suites). The Kafka-facing code shows lower numbers, because the mocked suites stub it and the end-to-end suite exercises it: `order_producer` 0%, `consumer_worker`'s group start-up and `retry_sup`'s lookup partly.
+- **Line coverage: 84%** (EUnit plus the mocked and store suites). The Kafka-facing code shows lower numbers, because those suites stub it and the end-to-end suite exercises it: `order_producer` 0%, `consumer_worker` 70%, `retry_sup` 55%.
+
+---
+
+## Load test
+
+[`scripts/load_test.escript`](scripts/load_test.escript) posts N orders from many concurrent senders over kept-alive connections. It then waits until the app's own `orders_processed_total` metric shows every order processed. Run it inside the compose network, so it measures the app rather than Docker Desktop's port forwarding:
+
+```bash
+docker compose run --rm --no-deps app escript scripts/load_test.escript 5000 50 http://orders:8080
+```
+
+**Measured** against the `orders` release, with the gateway's failure rates set to 0, so random retry delays do not stretch the tail:
+
+| Orders | Concurrency | API accepted | Processed end to end |
+| --- | --- | --- | --- |
+| 1,000 | 20 | 107 orders/s (9.3 s) | 100 orders/s (10.0 s) |
+| 5,000 | 50 | 277 orders/s (18.0 s) | 110 orders/s (45.3 s) |
+
+**Hardware:** AMD Ryzen 5 2500U laptop (4 cores, 8 threads, 6.9 GB RAM), Windows 10 Home. Docker Desktop on WSL2 had 8 CPUs and 3.3 GB. Kafka, PostgreSQL, the app, and the load generator all ran on that one machine.
+
+**Reading the numbers:**
+
+- Processing tops out around 110 orders/s. Each of the 3 partitions handles one order at a time. Every order does a gateway record and an idempotency mark in Mnesia, a PostgreSQL insert, and a synchronous publish to `orders.completed` before its offset is committed. More partitions would raise this.
+- The API accepts faster than processing, and Kafka absorbs the backlog.
+- `scripts/produce_orders.sh` (curl and xargs) is fine for demos, but on this machine it tops out near 60 requests/s from process start-up alone. Don't use it for throughput numbers.
 
 ---
 
@@ -325,9 +396,12 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 
 ```
 .
+├── .github/workflows/
+│   └── ci.yml                CI: everything except the end-to-end suite
 ├── config/
-│   ├── sys.config            app settings: ports, Kafka endpoints, timeouts
-│   └── vm.args
+│   ├── sys.config            app settings: ports, Kafka endpoints, timeouts, store, log format
+│   ├── vm.args
+│   └── prometheus.yml        Prometheus scrape config
 ├── docs/
 │   └── IMPLEMENTATION_GUIDE.md   architecture, data shapes, semantics, milestones
 ├── pacts/
@@ -338,11 +412,15 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 ├── priv/sql/
 │   └── schema.sql            PostgreSQL schema, applied by the app at boot (idempotent)
 ├── scripts/
-│   └── create_topics.sh      creates the four topics (safe to re-run)
+│   ├── create_topics.sh      creates the four topics by hand (safe to re-run)
+│   ├── produce_orders.sh     posts N orders (demo)
+│   └── load_test.escript     load test: API and end-to-end throughput
 ├── src/
 │   ├── order_app.erl         application entry point
 │   ├── order_sup.erl         top-level supervisor
-│   ├── order_http_handler.erl   thin HTTP shell: POST /orders, GET /orders/:id, /health
+│   ├── order_http_handler.erl   thin HTTP shell: POST /orders, GET /orders/:id, /health, /metrics
+│   ├── order_metrics.erl     declares the Prometheus metrics
+│   ├── order_log_formatter.erl  JSON log lines (OTP json module, no dependency)
 │   ├── order_validator.erl   pure: field and amount checks
 │   ├── order_codec.erl       pure: JSON encode and decode, DLQ messages
 │   ├── order_producer.erl    the only module that publishes to Kafka
@@ -363,28 +441,31 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 │   ├── unit/                 EUnit and PropEr
 │   ├── ct/                   Common Test suites, including the end-to-end suite
 │   └── pact/                 contract suites and the Pact matcher
-├── docker-compose.yml        Kafka, PostgreSQL, and the dev app container
-├── Dockerfile.dev            Erlang 28 plus cmake (for brod's native extension)
+├── docker-compose.yml        Kafka, PostgreSQL, topic init, the release, Prometheus, the dev container
+├── Dockerfile                production image: relx release on debian:trixie-slim
+├── Dockerfile.dev            dev image: Erlang 28 plus cmake (for brod's native extension)
 └── rebar.config
 ```
 
-### Supervision tree (target)
+### Supervision tree
 
 ```
 order_app
 └── order_sup (one_for_one)
-    ├── producer_sup        brod client                   ✅
-    ├── order_pg            PostgreSQL connection         ✅ only when store_impl is order_store_pg
-    ├── consumer_sup        supervisor                    ✅
+    ├── producer_sup        brod client
+    ├── order_pg            PostgreSQL connection (only when store_impl is order_store_pg)
+    ├── consumer_sup        supervisor
     │     └── consumer_group    brod group subscriber, one worker per partition
-    ├── retry_sup           supervisor (one_for_all)      ✅
+    ├── retry_sup           supervisor (one_for_all)
     │     ├── retry_manager     holds retries until not_before
     │     └── retry_group       brod group subscriber on orders.retry
-    ├── http_sup            cowboy listener               ✅
-    └── metrics_server                                    (phase 9)
+    └── http_sup            cowboy listener
 ```
 
-`idempotency_store` has no process. It is a plain module over a Mnesia table, so lookups on every message are not serialised behind one process.
+Two pieces have no process of their own:
+
+- **`idempotency_store`** is a plain module over a Mnesia table, so the lookup on every message is not serialised behind one process.
+- **Metrics** live in `prometheus.erl`'s own registry, so there is no `metrics_server`.
 
 Children start in the order shown and stop in reverse. On shutdown, HTTP stops first, then the consumers, then the producer they both depend on. Each partition worker finishes the order it is handling before it stops, and acked offsets are committed on the way out.
 
@@ -414,17 +495,20 @@ For the full specification, see [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTA
 | 6. Idempotency | `idempotency_store`, gateway idempotency key | The same order sent twice is charged once | ✅ |
 | 7. Contract tests | Pact file and suites | Renaming a field on the producer fails the build | ✅ |
 | 8. PostgreSQL | `order_store_pg` behind the behaviour | Switching `store_impl` changes the store with no code change | ✅ |
-| 9. Metrics and release | Prometheus, JSON logs, `relx` release, CI | `docker compose up` starts everything and CI is green | ⏳ next |
+| 9. Metrics and release | Prometheus, JSON logs, `relx` release, CI | `docker compose up` starts everything and CI is green | ✅ (CI runs on the first push) |
 
 ---
 
 ## Troubleshooting
 
 **`curl` returns `503 {"error":"kafka_unavailable"}`.**
-The app cannot reach Kafka, or the topics do not exist. Check `docker compose ps` and run `./scripts/create_topics.sh`.
+The app cannot reach Kafka, or the topics do not exist. Check `docker compose ps`; `kafka-init` should show `Exited (0)`. Rerun it with `docker compose up kafka-init`, or use `./scripts/create_topics.sh`.
 
 **The app container exits right after starting.**
-The app needs Kafka and, with the default store, PostgreSQL at boot: the `brod` client and the PostgreSQL connection both exit if they cannot connect. Make sure both show `(healthy)` in `docker compose ps`. The `app` service waits for those health checks, but a restart of either afterwards can still cause it.
+The app needs Kafka and, with the default store, PostgreSQL at boot: the `brod` client and the PostgreSQL connection both exit if they cannot connect. Make sure both show `(healthy)` in `docker compose ps`. The `orders` and `app` services wait for those health checks, but a restart of either afterwards can still cause it.
+
+**`port is already allocated` for 8080 when starting `orders` or `app`.**
+The release and the dev container both use port 8080. Stop one first: `docker compose stop orders`, or `docker compose stop app`.
 
 **`create_topics.sh` fails with `no such file or directory: C:/Program Files/Git/opt/kafka/...`.**
 Git Bash is rewriting the container path. The script sets `MSYS_NO_PATHCONV=1` itself; set it yourself when you run `docker compose exec` by hand.

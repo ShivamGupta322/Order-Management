@@ -42,8 +42,55 @@ services:
       timeout: 5s
       retries: 10
 
-  # The Erlang app runs in Linux because brod's crc32cer NIF only builds there.
-  # In the "dev" profile so `docker compose up -d` starts infrastructure only.
+  # One-shot: creates the four topics (3 partitions each) and exits.
+  # Idempotent; the same commands as scripts/create_topics.sh.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for t in orders orders.retry orders.completed orders.dlq; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092             --create --if-not-exists --topic "$$t" --partitions 3 --replication-factor 1
+        done
+    restart: "no"
+
+  # The production release (Dockerfile). `docker compose up` starts it with
+  # everything it needs. Do not run it together with the dev `app` service:
+  # they share port 8080, the node name and the Mnesia volume.
+  orders:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Mnesia disc tables are tied to the node name (order_processing@app).
+    hostname: app
+    volumes:
+      - mnesia_data:/var/lib/order_app
+    ports: ["8080:8080"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    # Room for in-flight orders to finish and offsets to be committed.
+    stop_grace_period: 30s
+    networks:
+      default:
+        aliases: [orders-app]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  # Development container: the project is bind-mounted and run with
+  # `rebar3 shell`. It runs in Linux because brod's crc32cer NIF only builds
+  # there. In the "dev" profile, so `docker compose up` does not start it.
   # Usage: docker compose run --rm --service-ports app rebar3 shell --sname order_processing
   app:
     build:
@@ -67,6 +114,9 @@ services:
       # The app connects to PostgreSQL at boot when store_impl is order_store_pg.
       postgres:
         condition: service_healthy
+    networks:
+      default:
+        aliases: [orders-app]
     stdin_open: true
     tty: true
     command: rebar3 shell --sname order_processing

@@ -8,7 +8,7 @@
 -include_lib("brod/include/brod.hrl").
 
 -export([start_app/0, stop_app/0, reset/0, base_url/0, feed/1, feed_raw/2,
-         feed_retry/3, published/1, receipt/0, wait_until/2]).
+         feed_retry/3, published/1, receipt/0, wait_until/2, metric/2]).
 
 -define(POLL_INTERVAL_MS, 50).
 
@@ -87,6 +87,13 @@ published(Topic) ->
     [Value || {_Pid, {order_producer, publish, [T, _Key, Value]}, _Result}
                   <- meck:history(order_producer),
               T =:= Topic].
+
+%% A counter's current value; 0 if it was never incremented for Labels.
+metric(Name, Labels) ->
+    case prometheus_counter:value(Name, Labels) of
+        undefined -> 0;
+        Value -> Value
+    end.
 
 receipt() ->
     #{order_id => <<"test">>, receipt_id => <<"r-1">>}.

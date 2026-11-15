@@ -9,7 +9,7 @@
 -export([init/2]).
 -export_type([route/0]).
 
--type route() :: orders | order | health.
+-type route() :: orders | order | health | metrics.
 
 -define(DEFAULT_MAX_BODY_BYTES, 65536).
 
@@ -20,6 +20,9 @@ init(Req0, Route) ->
 
 handle(health, <<"GET">>, Req) ->
     reply(200, #{status => ok}, Req);
+handle(metrics, <<"GET">>, Req) ->
+    cowboy_req:reply(200, #{<<"content-type">> => <<"text/plain; version=0.0.4">>},
+                     order_metrics:render(), Req);
 handle(orders, <<"POST">>, Req) ->
     create_order(Req);
 handle(order, <<"GET">>, Req) ->
@@ -52,6 +55,7 @@ publish({error, {Kind, Field}}, Req) ->
     reply(400, #{error => Kind, field => Field}, Req).
 
 respond(ok, Id, Req) ->
+    prometheus_counter:inc(orders_received_total),
     ?LOG_INFO(#{event => order_accepted, order_id => Id}),
     reply(202, #{id => Id}, Req);
 respond({error, Reason}, Id, Req) ->

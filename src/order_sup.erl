@@ -63,7 +63,8 @@ http_spec() ->
     Dispatch = cowboy_router:compile(
                  [{'_', [{"/orders", order_http_handler, orders},
                          {"/orders/:id", order_http_handler, order},
-                         {"/health", order_http_handler, health}]}]),
+                         {"/health", order_http_handler, health},
+                         {"/metrics", order_http_handler, metrics}]}]),
     Spec = ranch:child_spec(?HTTP_LISTENER, ranch_tcp,
                             #{socket_opts => [{port, Port}],
                               connection_type => supervisor},

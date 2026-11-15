@@ -1,0 +1,66 @@
+name: CI
+
+# Everything except the end-to-end suite, which needs Kafka (see the guide).
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Same image as Dockerfile.dev. Running the job in a container puts it on
+    # the services' network, so PostgreSQL is reachable as `postgres`, the host
+    # order_store_SUITE expects.
+    container: erlang:28.4.2
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+          POSTGRES_DB: orders
+        options: >-
+          --health-cmd "pg_isready -U orders -d orders"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cmake (brod's crc32cer NIF)
+        run: apt-get update && apt-get install -y --no-install-recommends cmake
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: rebar3-${{ runner.os }}-${{ hashFiles('rebar.lock', 'rebar.config') }}
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: EUnit
+        run: rebar3 eunit --cover
+
+      - name: Common Test (mocked)
+        run: rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE --cover
+
+      - name: Store contract (Mnesia and PostgreSQL)
+        run: rebar3 ct --dir test/ct --suite order_store_SUITE
+
+      - name: Pact contract
+        run: rebar3 ct --dir test/pact
+
+      # The consumer suite regenerates the pact; a diff means the contract
+      # changed without the file being committed.
+      - name: Pact file is committed
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git diff --exit-code -- pacts/
+
+      - name: Dialyzer
+        run: rebar3 dialyzer
+
+      - name: Coverage summary
+        run: rebar3 cover --verbose

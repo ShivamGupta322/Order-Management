@@ -1,0 +1,10 @@
+# Prometheus scrape config for docker-compose.yml. `orders-app` is a network
+# alias carried by both the release (`orders`) and the dev container (`app`).
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: order_processing
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orders-app:8080"]

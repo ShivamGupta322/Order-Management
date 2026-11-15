@@ -9,7 +9,9 @@ all() ->
      invalid_body_returns_400_and_publishes_nothing,
      produce_error_returns_503,
      wrong_method_returns_405,
-     health_returns_200].
+     health_returns_200,
+     accepted_order_increments_received_counter,
+     metrics_endpoint_serves_prometheus_text].
 
 init_per_suite(Config) ->
     %% Kafka edges are stubbed, so no broker is needed; see order_test_helper.
@@ -71,6 +73,22 @@ wrong_method_returns_405(Config) ->
 
 health_returns_200(Config) ->
     ?assertEqual({200, #{<<"status">> => <<"ok">>}}, request(get, Config, "/health")).
+
+accepted_order_increments_received_counter(Config) ->
+    Before = order_test_helper:metric(orders_received_total, []),
+    {202, _} = post(Config, encode(valid_order())),
+    {400, _} = post(Config, <<"{not json">>),
+    ?assertEqual(Before + 1, order_test_helper:metric(orders_received_total, [])).
+
+metrics_endpoint_serves_prometheus_text(Config) ->
+    {ok, {{_, 200, _}, Headers, Body}} =
+        httpc:request(get, {?config(base_url, Config) ++ "/metrics", []}, [],
+                      [{body_format, binary}]),
+    ?assertMatch("text/plain" ++ _, proplists:get_value("content-type", Headers)),
+    [?assertNotEqual(nomatch, binary:match(Body, Name))
+     || Name <- [<<"orders_received_total">>, <<"orders_processed_total">>,
+                 <<"orders_retried_total">>, <<"orders_dlq_total">>,
+                 <<"order_processing_duration_seconds">>]].
 
 %%--------------------------------------------------------------------
 
