@@ -15,6 +15,10 @@ init() ->
     ok = mnesia:start(),
     ok = ensure_table(order, [{attributes, record_info(fields, order)},
                               {Copies, [node()]}]),
+    ok = ensure_table(processed_order, [{attributes, record_info(fields, processed_order)},
+                                        {Copies, [node()]}]),
+    ok = ensure_table(gateway_charge, [{attributes, record_info(fields, gateway_charge)},
+                                       {Copies, [node()]}]),
     Wait = application:get_env(order_app, mnesia_wait_ms, ?DEFAULT_WAIT_MS),
     ok = mnesia:wait_for_tables(?TABLES, Wait).
 

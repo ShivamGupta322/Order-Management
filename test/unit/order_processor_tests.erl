@@ -9,7 +9,10 @@ processor_test_() ->
       fun timeout_is_retryable_and_not_saved/1,
       fun decline_is_fatal_and_saved_failed/1,
       fun invalid_order_is_fatal_and_not_charged/1,
-      fun fail_saves_failed/1]}.
+      fun fail_saves_failed/1,
+      fun completed_order_is_a_duplicate_and_not_charged/1,
+      fun failed_order_is_a_duplicate_and_not_charged/1,
+      fun timeout_is_not_marked_so_retry_charges/1]}.
 
 setup() ->
     ok = application:set_env(order_app, mnesia_copies, ram_copies),
@@ -31,23 +34,51 @@ success_saves_completed(_) ->
     ok = meck:expect(payment_gateway, charge, fun(_) -> {ok, Receipt} end),
     Result = order_processor:process(order()),
     [?_assertEqual({ok, Receipt}, Result),
-     ?_assertMatch({ok, #{status := completed, amount := 1500}}, order_store:get(<<"o-1">>))].
+     ?_assertMatch({ok, #{status := completed, amount := 1500}}, order_store:get(<<"o-1">>)),
+     ?_assert(idempotency_store:seen(<<"o-1">>))].
 
 timeout_is_retryable_and_not_saved(_) ->
     ok = meck:expect(payment_gateway, charge, fun(_) -> {error, timeout} end),
     Result = order_processor:process(order()),
     [?_assertEqual({error, retryable, timeout}, Result),
-     ?_assertEqual({error, not_found}, order_store:get(<<"o-1">>))].
+     ?_assertEqual({error, not_found}, order_store:get(<<"o-1">>)),
+     ?_assertNot(idempotency_store:seen(<<"o-1">>))].
 
 decline_is_fatal_and_saved_failed(_) ->
     ok = meck:expect(payment_gateway, charge, fun(_) -> {error, declined} end),
     Result = order_processor:process(order()),
     [?_assertEqual({error, fatal, declined}, Result),
-     ?_assertMatch({ok, #{status := failed}}, order_store:get(<<"o-1">>))].
+     ?_assertMatch({ok, #{status := failed}}, order_store:get(<<"o-1">>)),
+     ?_assert(idempotency_store:seen(<<"o-1">>))].
 
 fail_saves_failed(_) ->
     ok = order_processor:fail((order())#{attempt => 3}),
-    ?_assertMatch({ok, #{status := failed, attempt := 3}}, order_store:get(<<"o-1">>)).
+    [?_assertMatch({ok, #{status := failed, attempt := 3}}, order_store:get(<<"o-1">>)),
+     ?_assert(idempotency_store:seen(<<"o-1">>))].
+
+completed_order_is_a_duplicate_and_not_charged(_) ->
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {ok, #{receipt_id => <<"r-1">>}} end),
+    {ok, _} = order_processor:process(order()),
+    Second = order_processor:process(order()),
+    [?_assertEqual({ok, duplicate}, Second),
+     ?_assertEqual(1, meck:num_calls(payment_gateway, charge, '_'))].
+
+%% A declined order stays failed: a redelivery must not get another roll.
+failed_order_is_a_duplicate_and_not_charged(_) ->
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {error, declined} end),
+    {error, fatal, declined} = order_processor:process(order()),
+    Second = order_processor:process(order()),
+    [?_assertEqual({ok, duplicate}, Second),
+     ?_assertEqual(1, meck:num_calls(payment_gateway, charge, '_')),
+     ?_assertMatch({ok, #{status := failed}}, order_store:get(<<"o-1">>))].
+
+timeout_is_not_marked_so_retry_charges(_) ->
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {error, timeout} end),
+    {error, retryable, timeout} = order_processor:process(order()),
+    ok = meck:expect(payment_gateway, charge, fun(_) -> {ok, #{receipt_id => <<"r-2">>}} end),
+    Retry = order_processor:process((order())#{attempt => 1}),
+    [?_assertEqual({ok, #{receipt_id => <<"r-2">>}}, Retry),
+     ?_assertEqual(2, meck:num_calls(payment_gateway, charge, '_'))].
 
 invalid_order_is_fatal_and_not_charged(_) ->
     ok = meck:expect(payment_gateway, charge, fun(_) -> {ok, #{}} end),

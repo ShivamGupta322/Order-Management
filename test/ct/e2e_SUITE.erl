@@ -23,7 +23,8 @@
 all() ->
     [order_completes_end_to_end,
      killed_worker_loses_no_orders,
-     failing_order_retries_then_lands_on_dlq].
+     failing_order_retries_then_lands_on_dlq,
+     duplicate_post_is_processed_once].
 
 init_per_suite(Config) ->
     case gen_tcp:connect(?KAFKA_HOST, ?KAFKA_PORT, [], 2000) of
@@ -97,6 +98,27 @@ failing_order_retries_then_lands_on_dlq(Config) ->
     ok = order_test_helper:wait_until(
            fun() -> topic_end_offsets(<<"orders.dlq">>) >= DlqBefore + 1 end, 10000),
     ?assertEqual(RetryBefore + 3, topic_end_offsets(<<"orders.retry">>)).
+
+%% The same order posted twice lands twice on `orders`, but completes once.
+%% A sentinel order on the same partition, posted afterwards, proves the
+%% second copy was consumed: partitions are processed in order.
+duplicate_post_is_processed_once(Config) ->
+    Id = order_id(Config, <<"dup">>, 1),
+    Sentinel = same_partition_id(Config, Id, 1),
+    CompletedBefore = topic_end_offsets(<<"orders.completed">>),
+    ?assertEqual(202, post_order(Id)),
+    ?assertEqual(202, post_order(Id)),
+    ?assertEqual(202, post_order(Sentinel)),
+    ok = order_test_helper:wait_until(fun() -> completed(Sentinel) end, 20000),
+    ?assert(completed(Id)),
+    ?assertEqual(CompletedBefore + 2, topic_end_offsets(<<"orders.completed">>)).
+
+same_partition_id(Config, Id, N) ->
+    Candidate = order_id(Config, <<"sentinel">>, N),
+    case erlang:phash2(Candidate) rem ?PARTITIONS =:= erlang:phash2(Id) rem ?PARTITIONS of
+        true -> Candidate;
+        false -> same_partition_id(Config, Id, N + 1)
+    end.
 
 %%--------------------------------------------------------------------
 

@@ -16,7 +16,9 @@ all() ->
      poison_message_goes_to_dlq_and_commits,
      get_order_returns_stored_order,
      get_unknown_order_returns_404,
-     worker_restarts_after_crash].
+     worker_restarts_after_crash,
+     duplicate_order_processed_once,
+     charge_is_replayed_after_crash_before_mark].
 
 init_per_suite(Config) ->
     ok = order_test_helper:start_app(),
@@ -168,6 +170,35 @@ get_order_returns_stored_order(_Config) ->
 
 get_unknown_order_returns_404(_Config) ->
     ?assertEqual({404, #{<<"error">> => <<"not_found">>}}, http_get("/orders/nope")).
+
+%% From the guide. feed/1 is synchronous, so no sleep is needed before
+%% counting: both deliveries are fully handled when it returns.
+duplicate_order_processed_once(_Config) ->
+    Order = order(<<"dup-1">>),
+    ?assertMatch({ok, commit, _}, order_test_helper:feed(Order)),
+    ?assertMatch({ok, commit, _}, order_test_helper:feed(Order)),
+    ?assertEqual(1, meck:num_calls(payment_gateway, charge, '_')),
+    ?assertEqual(1, length(order_test_helper:published(<<"orders.completed">>))),
+    ?assertEqual([], order_test_helper:published(<<"orders.dlq">>)),
+    ?assertMatch({ok, #{status := completed}}, order_store:get(<<"dup-1">>)).
+
+%% The gap the guide calls out: the gateway charged, then the worker died
+%% before saving and marking, so the message comes back. With the real
+%% gateway, the second charge replays the first receipt instead of charging.
+charge_is_replayed_after_crash_before_mark(_Config) ->
+    ok = application:set_env(order_app, gateway_timeout_rate, 0.0),
+    ok = application:set_env(order_app, gateway_decline_rate, 0.0),
+    ok = meck:expect(payment_gateway, charge, fun(O) -> meck:passthrough([O]) end),
+    Order = order(<<"crash-1">>),
+    {ok, First} = payment_gateway:charge(Order),        % charged, then "crash"
+    ?assertNot(idempotency_store:seen(<<"crash-1">>)),
+    ?assertMatch({ok, commit, _}, order_test_helper:feed(Order)),  % redelivery
+    Results = [R || {_, {payment_gateway, charge, _}, R} <- meck:history(payment_gateway)],
+    ?assertEqual([{ok, First}, {ok, First}], Results),
+    ?assertMatch({ok, #{status := completed}}, order_store:get(<<"crash-1">>)),
+    ?assert(idempotency_store:seen(<<"crash-1">>)),
+    ok = application:unset_env(order_app, gateway_timeout_rate),
+    ok = application:unset_env(order_app, gateway_decline_rate).
 
 %% Supervision wiring: consumer_sup restarts the consumer and nothing else in
 %% the app is touched. That no order is lost is proven against real Kafka in

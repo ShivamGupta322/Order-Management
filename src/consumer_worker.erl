@@ -113,6 +113,9 @@ process({error, Reason}, Value, Meta) ->
     %% A poison message must not stall the partition: dead-letter and commit.
     dead_letter(raw_dead_letter(Value, Reason), Reason, Meta).
 
+route({ok, duplicate}, _Order, _Value, Meta) ->
+    %% Already completed or failed: skip and commit, publish nothing.
+    ?LOG_INFO(Meta#{event => order_duplicate});
 route({ok, _Receipt}, _Order, Value, #{order_id := Key} = Meta) ->
     ok = order_producer:publish(?TOPIC_COMPLETED, Key, Value),
     ?LOG_INFO(Meta#{event => order_completed});

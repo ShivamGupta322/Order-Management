@@ -22,7 +22,8 @@ start_app() ->
     ok = meck:expect(order_producer, start_link, fun start_stub/0),
     ok = meck:new(consumer_worker, [passthrough, no_link]),
     ok = meck:expect(consumer_worker, start_link, fun(_Role) -> start_stub() end),
-    ok = meck:new(payment_gateway, [no_link]),
+    %% passthrough lets a test opt into the real gateway with meck:passthrough/1.
+    ok = meck:new(payment_gateway, [passthrough, no_link]),
     ok = reset(),
     {ok, _} = application:ensure_all_started(order_app),
     ok.
@@ -48,7 +49,8 @@ flush_commits() ->
 
 clear_tables() ->
     case mnesia:system_info(is_running) of
-        yes -> {atomic, ok} = mnesia:clear_table(order), ok;
+        yes -> [{atomic, ok} = mnesia:clear_table(T) || T <- [order, processed_order, gateway_charge]],
+               ok;
         no -> ok
     end.
 

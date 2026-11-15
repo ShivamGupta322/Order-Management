@@ -93,11 +93,12 @@ order_app
     │     ├── retry_manager     gen_server holding retries until not_before
     │     └── retry_group       brod_group_subscriber_v2 on orders.retry
     ├── http_sup            cowboy listener
-    ├── idempotency_store   Mnesia-backed
     └── metrics_server
 ```
 
 Children start top to bottom and stop in reverse. On shutdown, HTTP stops first, then the consumers, then the producer they depend on.
+
+`idempotency_store` is not in the tree. It is a plain module over a Mnesia table and has no process: a gen_server would only serialise a lookup made on every message, and Mnesia already handles concurrent access.
 
 Each partition has its own worker process, so partitions are processed in parallel and in order within each partition. The partition workers are owned by brod's group subscriber, not directly by `consumer_sup`.
 
@@ -156,10 +157,13 @@ The client sends `id`, `customer_id`, `amount`, `currency`, and `items`. The API
 
 ### Mnesia tables
 
-Records live in `include/order_tables.hrl`, the one place tables are named. `processed_order` arrives in phase 6.
+Records live in `include/order_tables.hrl`, the one place tables are named. `gateway_charge` is the simulated payment gateway's own memory of final charge results, keyed by order ID. It stands in for a real gateway's storage, and only `payment_gateway` touches it.
 
 ```erlang
 -record(processed_order, {id :: binary(), processed_at :: integer()}).
+-record(gateway_charge, {order_id :: binary(),
+                         result :: {ok, map()} | {error, declined},
+                         charged_at :: integer()}).
 -record(order, {id :: binary(),
                 status :: pending | processing | completed | failed,
                 customer_id :: binary(),
@@ -301,6 +305,16 @@ process(Order = #{id := Id}) ->
 ```
 
 There is a real gap here to be honest about: a crash after `charge` succeeds but before `mark` leads to a second charge on redelivery. A real gateway closes it by accepting the order ID as an idempotency key. Make the simulated gateway do the same, and be ready to explain it in interviews.
+
+How it is built:
+
+- **Order of checks.** `order_processor` validates first, then checks `idempotency_store:seen/1`. An order without a usable ID never reaches the lookup.
+- **Duplicates.** A seen order returns `{ok, duplicate}`. The worker logs `order_duplicate`, publishes nothing, and commits.
+- **What counts as processed.** An ID is marked on any **final** outcome: `completed`, or `failed` (declined, or retries used up). A redelivered declined order is not given another roll of the dice. A timeout is not final and is not marked, so retries still run. Because failed IDs are marked too, a client that wants to try again after a decline must use a new order ID.
+- **Write order.** The order is saved, then marked, then the offset is committed, matching the consistency rule above.
+- **Gateway idempotency key.** `payment_gateway` keeps final results (success or decline) per order ID in its own `gateway_charge` table. Charging the same order again returns the stored result without a new charge. This closes the gap above. Timeouts are not stored, because a timed-out request never reached the gateway.
+- **Duplicates while an order is still retrying.** Say a duplicate arrives while the original is waiting in `orders.retry`. Both copies may run, but the gateway charges at most once. The first copy to reach a final outcome marks the ID, and the other copy is skipped at its next attempt. Both copies may publish to `orders.completed`, so downstream consumers should also treat order ID as an idempotency key.
+- **No expiry yet.** Marked IDs and gateway records are never deleted. A redelivery can only happen within Kafka's retention period (7 days by default), so a pruner could later remove older entries.
 
 ### Graceful shutdown
 
