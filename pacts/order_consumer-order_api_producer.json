@@ -1,0 +1,105 @@
+{
+  "consumer": {
+    "name": "order_consumer"
+  },
+  "messages": [
+    {
+      "contents": {
+        "amount": 1500,
+        "attempt": 0,
+        "created_at": "2026-11-14T10:00:00Z",
+        "currency": "INR",
+        "customer_id": "c-42",
+        "id": "o-1",
+        "items": [
+          {
+            "qty": 2,
+            "sku": "SKU-1"
+          }
+        ]
+      },
+      "description": "an order created event",
+      "matchingRules": {
+        "body": {
+          "$.amount": {
+            "matchers": [
+              {
+                "match": "integer"
+              }
+            ]
+          },
+          "$.attempt": {
+            "matchers": [
+              {
+                "match": "integer"
+              }
+            ]
+          },
+          "$.created_at": {
+            "matchers": [
+              {
+                "match": "regex",
+                "regex": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+              }
+            ]
+          },
+          "$.currency": {
+            "matchers": [
+              {
+                "match": "regex",
+                "regex": "^[A-Z]{3}$"
+              }
+            ]
+          },
+          "$.customer_id": {
+            "matchers": [
+              {
+                "match": "type"
+              }
+            ]
+          },
+          "$.id": {
+            "matchers": [
+              {
+                "match": "type"
+              }
+            ]
+          },
+          "$.items": {
+            "matchers": [
+              {
+                "match": "type",
+                "min": 1
+              }
+            ]
+          },
+          "$.items[*].qty": {
+            "matchers": [
+              {
+                "match": "integer"
+              }
+            ]
+          },
+          "$.items[*].sku": {
+            "matchers": [
+              {
+                "match": "type"
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "contentType": "application/json"
+      }
+    }
+  ],
+  "metadata": {
+    "pactSpecification": {
+      "version": "3.0.0"
+    }
+  },
+  "provider": {
+    "name": "order_api_producer"
+  }
+}
