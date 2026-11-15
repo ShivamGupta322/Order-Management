@@ -19,7 +19,9 @@ init([]) ->
     SupFlags = #{strategy => one_for_one, intensity => 5, period => 10},
     %% Children stop in reverse start order, so on shutdown HTTP stops first,
     %% then retries and consumers, then the producer all of them depend on.
-    {ok, {SupFlags, [producer_spec(), consumer_spec(), retry_spec(), http_spec()]}}.
+    Store = application:get_env(order_app, store_impl, order_store_mnesia),
+    {ok, {SupFlags, [producer_spec()] ++ store_specs(Store) ++
+                    [consumer_spec(), retry_spec(), http_spec()]}}.
 
 producer_spec() ->
     #{id => producer_sup,
@@ -28,6 +30,18 @@ producer_spec() ->
       shutdown => application:get_env(order_app, producer_shutdown_ms,
                                       ?DEFAULT_PRODUCER_SHUTDOWN_MS),
       type => worker}.
+
+%% The PostgreSQL connection runs only when it is the configured store, and
+%% starts before the consumers that write through it.
+store_specs(order_store_pg) ->
+    [#{id => order_pg,
+       start => {order_store_pg, start_link, []},
+       restart => permanent,
+       shutdown => application:get_env(order_app, producer_shutdown_ms,
+                                       ?DEFAULT_PRODUCER_SHUTDOWN_MS),
+       type => worker}];
+store_specs(_Mnesia) ->
+    [].
 
 consumer_spec() ->
     #{id => consumer_sup,

@@ -8,6 +8,8 @@
 -export([save/1, get/1, update_status/2]).
 
 %% Only validated orders are saved, so missing fields are a bug and crash here.
+%% Insert-if-absent, like order_store_pg: the first final outcome wins and a
+%% redelivered one is a no-op.
 -spec save(map()) -> ok | {error, term()}.
 save(#{id := Id, status := Status} = Order) ->
     Row = #order{id = Id,
@@ -19,7 +21,10 @@ save(#{id := Id, status := Status} = Order) ->
                  attempt = maps:get(attempt, Order, 0),
                  created_at = maps:get(created_at, Order, undefined),
                  updated_at = order_clock:now_ms()},
-    transaction(fun() -> mnesia:write(Row) end).
+    transaction(fun() -> insert_new(mnesia:read(order, Id, write), Row) end).
+
+insert_new([], Row) -> mnesia:write(Row);
+insert_new([_Existing], _Row) -> ok.
 
 -spec get(binary()) -> {ok, map()} | {error, not_found}.
 get(Id) ->

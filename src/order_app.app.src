@@ -3,7 +3,7 @@
   {vsn, "0.1.0"},
   {registered, [order_sup, consumer_sup, retry_sup, retry_manager]},
   {mod, {order_app, []}},
-  {applications, [kernel, stdlib, jsx, ranch, cowboy, brod]},
+  {applications, [kernel, stdlib, jsx, ranch, cowboy, brod, epgsql]},
   {env, []},
   {modules, []},
   {licenses, []},

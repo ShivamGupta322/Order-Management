@@ -3,7 +3,8 @@
 %% End-to-end against the real Kafka from Docker Compose. Not part of the
 %% default run; start it with:
 %%   docker compose run --rm app rebar3 ct --dir test/ct --suite e2e_SUITE
-%% Nothing is mocked. Mnesia runs in RAM, and each run uses a fresh consumer
+%% Nothing is mocked. Orders are stored in PostgreSQL (the default store;
+%% IDs are unique per run), Mnesia runs in RAM, and each run uses a fresh consumer
 %% group that starts at the latest offset, so old messages are not replayed.
 %%
 %% `latest' only applies to a partition with no committed offset. A restart
@@ -39,6 +40,9 @@ start(Config) ->
     RunId = integer_to_binary(erlang:system_time(millisecond)),
     Env = [{http_port, 0},
            {mnesia_copies, ram_copies},
+           {store_impl, order_store_pg},
+           {pg, #{host => "postgres", port => 5432, username => "orders",
+                  password => "orders", database => "orders", timeout => 5000}},
            {kafka_endpoints, [{?KAFKA_HOST, ?KAFKA_PORT}]},
            {consumer_group_id, <<"e2e-", RunId/binary>>},
            {retry_group_id, <<"e2e-retry-", RunId/binary>>},

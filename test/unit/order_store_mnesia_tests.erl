@@ -5,7 +5,7 @@ store_test_() ->
     {foreach, fun setup/0, fun cleanup/1,
      [fun save_then_get_roundtrips/1,
       fun get_unknown_is_not_found/1,
-      fun save_overwrites/1,
+      fun save_keeps_first_outcome/1,
       fun update_status/1,
       fun update_status_unknown_is_not_found/1,
       fun created_at_is_optional/1]}.
@@ -33,10 +33,11 @@ save_then_get_roundtrips(_) ->
 get_unknown_is_not_found(_) ->
     ?_assertEqual({error, not_found}, order_store_mnesia:get(<<"nope">>)).
 
-save_overwrites(_) ->
+%% Insert-if-absent: a redelivered result never replaces the first one.
+save_keeps_first_outcome(_) ->
     ok = order_store_mnesia:save((order())#{status => failed}),
     ok = order_store_mnesia:save(order()),
-    ?_assertMatch({ok, #{status := completed}}, order_store_mnesia:get(<<"o-1">>)).
+    ?_assertMatch({ok, #{status := failed}}, order_store_mnesia:get(<<"o-1">>)).
 
 update_status(_) ->
     ok = order_store_mnesia:save(order()),

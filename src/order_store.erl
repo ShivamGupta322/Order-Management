@@ -2,6 +2,11 @@
 
 %% Storage contract. The implementation is chosen with the `store_impl' app
 %% env, so business code never calls Mnesia or PostgreSQL directly.
+%%
+%% save/1 is insert-if-absent: saving an order that already exists returns ok
+%% and changes nothing, so a redelivered final result is a no-op (the guide's
+%% `INSERT ... ON CONFLICT (id) DO NOTHING'). update_status/2 changes an
+%% existing order and returns {error, not_found} otherwise.
 
 -export([save/1, get/1, update_status/2]).
 -export_type([status/0]).

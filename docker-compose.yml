@@ -33,6 +33,14 @@ services:
       POSTGRES_PASSWORD: orders
       POSTGRES_DB: orders
     ports: ["5432:5432"]
+    # The system of record, so its data survives container restarts.
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   # The Erlang app runs in Linux because brod's crc32cer NIF only builds there.
   # In the "dev" profile so `docker compose up -d` starts infrastructure only.
@@ -56,6 +64,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      # The app connects to PostgreSQL at boot when store_impl is order_store_pg.
+      postgres:
+        condition: service_healthy
     stdin_open: true
     tty: true
     command: rebar3 shell --sname order_processing
@@ -64,3 +75,4 @@ volumes:
   app_build:
   rebar3_cache:
   mnesia_data:
+  pg_data:

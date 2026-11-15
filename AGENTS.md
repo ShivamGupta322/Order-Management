@@ -61,6 +61,8 @@ docker compose run --rm --service-ports app rebar3 shell --sname order_processin
 docker compose run --rm app rebar3 compile
 docker compose run --rm app rebar3 eunit --cover           # unit tests
 docker compose run --rm app rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE
+docker compose run --rm app rebar3 ct --dir test/ct --suite order_store_SUITE   # both stores; needs PostgreSQL
+docker compose run --rm app rebar3 ct --dir test/ct --suite e2e_SUITE           # real Kafka and PostgreSQL
 docker compose run --rm app rebar3 ct --dir test/pact      # contract tests
 docker compose run --rm app rebar3 dialyzer
 ```

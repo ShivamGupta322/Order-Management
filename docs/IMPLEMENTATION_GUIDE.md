@@ -84,6 +84,7 @@ Use 3 partitions per topic for local development, and key every message by order
 order_app
 └── order_sup (one_for_one)
     ├── producer_sup        brod client, shared by producer and consumers
+    ├── order_pg            epgsql connection (only when store_impl is order_store_pg)
     ├── consumer_sup        supervisor
     │     └── consumer_group    brod_group_subscriber_v2
     │           ├── worker for partition 0   (consumer_worker callbacks)
@@ -198,18 +199,37 @@ The `order` record holds the full order, not just its status. That way `GET /ord
 
 ### PostgreSQL schema
 
+The full schema is `priv/sql/schema.sql`. `order_store_pg` applies it every time it connects, and every statement is `IF NOT EXISTS`, so a fresh database, the live app, and the tests all set themselves up.
+
 ```sql
-CREATE TABLE orders (
-  id          TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS orders (
+  id          TEXT        PRIMARY KEY,
   customer_id TEXT        NOT NULL,
   amount      BIGINT      NOT NULL CHECK (amount > 0),
   currency    TEXT        NOT NULL,
+  items       JSONB       NOT NULL,
   status      TEXT        NOT NULL,
   attempt     INT         NOT NULL DEFAULT 0,
-  created_at  TIMESTAMPTZ NOT NULL,
+  created_at  TIMESTAMPTZ,
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS order_status_history (
+  id         BIGSERIAL   PRIMARY KEY,
+  order_id   TEXT        NOT NULL REFERENCES orders (id),
+  status     TEXT        NOT NULL,
+  attempt    INT         NOT NULL,
+  changed_at TIMESTAMPTZ NOT NULL
+);
 ```
+
+Changes from the original sketch:
+
+- **`items`** is a `JSONB` column, so `GET /orders/:id` returns the same order from either store.
+- **`created_at`** is nullable, matching the Mnesia store, where it is optional.
+- **`order_status_history`** holds the status history this section says PostgreSQL keeps. Each `save` and `update_status` writes its history row in the same SQL statement (a data-modifying `WITH`), so the order and its history cannot disagree.
+
+**Connection.** `order_store_pg` runs one epgsql connection. `order_sup` starts it, only when `store_impl` is `order_store_pg`, before the consumers. It is registered as `order_pg` and shared by all partition workers. Every query is a named prepared statement, parsed once per connection. `epgsql:equery/3` must not be used on a shared connection: it parses an unnamed statement and executes it in a separate command, so concurrent callers overwrite each other's statement ("unnamed prepared statement does not exist"). `order_store_SUITE:concurrent_writers_all_succeed` guards this. epgsql has no client-side query timeout, so `pg_statement_timeout_ms` sets PostgreSQL's `statement_timeout` instead. The `pg` app env holds the connection options. PostgreSQL has a `pg_data` volume and a `pg_isready` health check that the app waits for.
 
 ### Storage behaviour
 
@@ -230,6 +250,10 @@ save(Order)             -> (impl()):save(Order).
 get(Id)                 -> (impl()):get(Id).
 update_status(Id, S)    -> (impl()):update_status(Id, S).
 ```
+
+Both implementations follow the same contract. `save/1` is insert-if-absent: saving an existing order returns `ok` and changes nothing, so the first final outcome wins and a redelivered one is a no-op. `update_status/2` returns `{error, not_found}` for an unknown order. `order_store_SUITE` runs the same cases against both implementations, selected through `store_impl` exactly as the app does.
+
+`sys.config` sets `store_impl` to `order_store_pg`. Setting it to `order_store_mnesia` switches the store with no code change, and `order_sup` then skips the PostgreSQL connection. Idempotency keys and the simulated gateway's memory stay in Mnesia either way.
 
 ### Consistency rule when both stores are used
 
@@ -628,6 +652,7 @@ Verified against the real code: with the API handler patched to publish `total` 
 | `rebar3 proper` | Property tests (needs the `rebar3_proper` plugin) |
 | `rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE --cover` | Mocked integration suites |
 | `rebar3 ct --dir test/pact` | Contract tests |
+| `rebar3 ct --dir test/ct --suite order_store_SUITE` | Store contract against Mnesia and PostgreSQL (the PostgreSQL group skips itself if PostgreSQL is down) |
 | `rebar3 ct --dir test/ct --suite e2e_SUITE` | End-to-end, with Docker Compose running |
 | `rebar3 dialyzer` | Type checks |
 

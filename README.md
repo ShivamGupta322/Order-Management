@@ -6,7 +6,7 @@ Orders arrive over a REST API, are published to Kafka, and are processed by supe
 
 There is no frontend. You drive it with `curl`, Postman, or a producer script.
 
-> **Status:** in progress. Phases 1–7 of 9 are done: orders flow end to end from `POST /orders` through Kafka to a stored status, a killed consumer recovers without losing orders, failed payments are retried with backoff before landing on the dead-letter topic, a duplicate or redelivered order is never charged twice, and a contract test fails the build if the producer changes the event shape. See [Roadmap](#roadmap).
+> **Status:** in progress. Phases 1–8 of 9 are done: orders flow end to end from `POST /orders` through Kafka into PostgreSQL, a killed consumer recovers without losing orders, failed payments are retried with backoff before landing on the dead-letter topic, a duplicate or redelivered order is never charged twice, and a contract test fails the build if the producer changes the event shape. Metrics, the release, and CI come in phase 9. See [Roadmap](#roadmap).
 
 ---
 
@@ -93,8 +93,8 @@ Messages on `orders.retry` also carry `not_before` (Unix milliseconds). Messages
 | Kafka client | [`brod`](https://github.com/kafka4beam/brod) |
 | HTTP | `cowboy` |
 | JSON | `jsx` |
-| Fast state | Mnesia (order records until phase 8, then idempotency keys and retry counters) |
-| System of record | PostgreSQL through `epgsql` (phase 8) |
+| Fast state | Mnesia (idempotency keys, the simulated gateway's memory; optionally order records) |
+| System of record | PostgreSQL through `epgsql`: orders and their status history |
 | Metrics | `prometheus.erl` (phase 9) |
 | Tests | EUnit, PropEr, Common Test, `meck`, Pact |
 | Infrastructure | Docker Compose: Kafka 3.9 (KRaft, no ZooKeeper), PostgreSQL 16 |
@@ -158,7 +158,7 @@ docker compose --profile dev down
 
 > Kafka has no data volume, so topics are lost when its container is removed or recreated. Run `./scripts/create_topics.sh` again after `down`. The script is safe to re-run.
 >
-> Stored orders live in the `mnesia_data` volume and survive `down`. To wipe them, run `docker compose --profile dev down -v`. That also deletes the build cache volumes, so the next start recompiles.
+> Orders (in the `pg_data` volume) and idempotency keys (in the `mnesia_data` volume) survive `down`. To wipe both, run `docker compose --profile dev down -v`. That also deletes the build cache volumes, so the next start recompiles. Wipe them together: keeping the idempotency keys while losing the orders would make re-sent orders look like duplicates of orders that no longer exist.
 
 ---
 
@@ -193,6 +193,27 @@ curl localhost:8080/orders/o-1001
 ```
 
 `status` is `completed`, or `failed` (payment declined, or retries used up). `updated_at` is Unix time in milliseconds. An order that has not been processed yet, or is waiting for a retry, returns `404`.
+
+### Look at the database
+
+Orders and their status history are in PostgreSQL:
+
+```bash
+MSYS_NO_PATHCONV=1 docker compose exec postgres psql -U orders -d orders \
+  -c "SELECT id, status, amount, currency, items, attempt FROM orders ORDER BY updated_at DESC LIMIT 5;" \
+  -c "SELECT order_id, status, attempt, changed_at FROM order_status_history ORDER BY id DESC LIMIT 5;"
+```
+
+### Switch the store
+
+Storage is an OTP behaviour (`order_store`) with two implementations, selected in `config/sys.config`:
+
+```erlang
+{store_impl, order_store_pg},       % PostgreSQL, the default
+%% {store_impl, order_store_mnesia}, % Mnesia only
+```
+
+Change the line and restart the app; no code changes. With Mnesia, the app starts no PostgreSQL connection. Both stores pass the same contract tests (`order_store_SUITE`).
 
 ### Validation rules
 
@@ -269,6 +290,7 @@ docker compose run --rm app rebar3 compile
 docker compose run --rm app rebar3 eunit --cover
 docker compose run --rm app rebar3 ct --dir test/ct --suite order_consumer_SUITE,order_producer_SUITE --cover
 docker compose run --rm app rebar3 ct --dir test/pact  # contract tests; regenerates pacts/
+docker compose run --rm app rebar3 ct --dir test/ct --suite order_store_SUITE   # both stores; needs PostgreSQL
 docker compose run --rm app rebar3 cover --verbose     # coverage summary
 docker compose run --rm app rebar3 dialyzer
 
@@ -284,14 +306,16 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 | --- | --- | --- | --- |
 | Unit | EUnit, PropEr | Validation, JSON codec (with a property-based round trip), retry policy, processor outcomes and duplicates, Mnesia store, idempotency store, simulated gateway and its idempotency key | `test/unit/` |
 | Integration | Common Test, `meck` | HTTP API, consumer outcomes, `GET /orders/:id`, retries (backoff, release after `not_before`, in-order commits, the full timeout-to-DLQ loop), consumer restart after a crash, duplicates charged once, gateway replay after a crash before marking | `test/ct/` |
+| Store contract | Common Test | The same store cases against Mnesia and PostgreSQL, including 50 concurrent writers; PostgreSQL status history | `test/ct/order_store_SUITE.erl` |
 | Contract | Pact v3 message pact, own verifier | Shape of the `order.created` event: the consumer's needs are written to `pacts/`, and the payload the API really publishes is checked against them | `test/pact/` |
-| End-to-end | Common Test | Real Kafka: an order completes; 30 orders all complete despite a worker killed mid-batch; a failing order retries three times and lands on `orders.dlq`; an order posted twice completes once | `test/ct/e2e_SUITE.erl` |
+| End-to-end | Common Test | Real Kafka and PostgreSQL: an order completes; 30 orders all complete despite a worker killed mid-batch; a failing order retries three times and lands on `orders.dlq`; an order posted twice completes once | `test/ct/e2e_SUITE.erl` |
 
 **Current results:**
 - EUnit: 151 tests pass, including 300 generated PropEr round-trip cases.
 - Common Test: all 21 mocked cases pass (consumer suite 15, producer suite 6).
 - Contract: all 6 Pact cases pass. A deliberate rename of `amount` to `total` in the producer makes them fail, as intended.
-- End-to-end: all 4 cases pass against real Kafka.
+- Store contract: all 15 cases pass (Mnesia 7, PostgreSQL 8).
+- End-to-end: all 4 cases pass against real Kafka and PostgreSQL.
 - Dialyzer: clean.
 - Line coverage: 84% at phase 5 (EUnit plus the mocked suites). The Kafka-facing code shows lower numbers, because the mocked suites stub it and the end-to-end suite exercises it: `order_producer` 0%, `consumer_worker`'s group start-up and `retry_sup`'s lookup partly.
 
@@ -311,6 +335,8 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 ├── include/
 │   ├── order_topics.hrl      Kafka topic names, defined once
 │   └── order_tables.hrl      Mnesia records and table names, defined once
+├── priv/sql/
+│   └── schema.sql            PostgreSQL schema, applied by the app at boot (idempotent)
 ├── scripts/
 │   └── create_topics.sh      creates the four topics (safe to re-run)
 ├── src/
@@ -329,6 +355,7 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 │   ├── payment_gateway.erl   simulated gateway: configurable failure rates, order ID as idempotency key
 │   ├── order_store.erl       storage behaviour, implementation chosen in config
 │   ├── order_store_mnesia.erl   Mnesia implementation
+│   ├── order_store_pg.erl    PostgreSQL implementation, the system of record
 │   ├── idempotency_store.erl order IDs with a final outcome (Mnesia, no process)
 │   ├── order_mnesia.erl      creates the schema and tables at boot
 │   └── order_clock.erl       the one place the app reads the clock
@@ -347,6 +374,7 @@ The unit and Common Test suites do **not** need Kafka. The Kafka client, the con
 order_app
 └── order_sup (one_for_one)
     ├── producer_sup        brod client                   ✅
+    ├── order_pg            PostgreSQL connection         ✅ only when store_impl is order_store_pg
     ├── consumer_sup        supervisor                    ✅
     │     └── consumer_group    brod group subscriber, one worker per partition
     ├── retry_sup           supervisor (one_for_all)      ✅
@@ -385,8 +413,8 @@ For the full specification, see [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTA
 | 5. Retry and DLQ | `retry_policy`, `retry_manager`, error classification | A failing order retries three times, then lands on `orders.dlq` | ✅ |
 | 6. Idempotency | `idempotency_store`, gateway idempotency key | The same order sent twice is charged once | ✅ |
 | 7. Contract tests | Pact file and suites | Renaming a field on the producer fails the build | ✅ |
-| 8. PostgreSQL | `order_store_pg` behind the behaviour | Switching `store_impl` changes the store with no code change | ⏳ next |
-| 9. Metrics and release | Prometheus, JSON logs, `relx` release, CI | `docker compose up` starts everything and CI is green | |
+| 8. PostgreSQL | `order_store_pg` behind the behaviour | Switching `store_impl` changes the store with no code change | ✅ |
+| 9. Metrics and release | Prometheus, JSON logs, `relx` release, CI | `docker compose up` starts everything and CI is green | ⏳ next |
 
 ---
 
@@ -396,7 +424,7 @@ For the full specification, see [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTA
 The app cannot reach Kafka, or the topics do not exist. Check `docker compose ps` and run `./scripts/create_topics.sh`.
 
 **The app container exits right after starting.**
-The `brod` client exits at startup if no broker is reachable. Make sure Kafka shows `(healthy)` in `docker compose ps`. The `app` service waits for that health check, but a Kafka restart afterwards can still cause it.
+The app needs Kafka and, with the default store, PostgreSQL at boot: the `brod` client and the PostgreSQL connection both exit if they cannot connect. Make sure both show `(healthy)` in `docker compose ps`. The `app` service waits for those health checks, but a restart of either afterwards can still cause it.
 
 **`create_topics.sh` fails with `no such file or directory: C:/Program Files/Git/opt/kafka/...`.**
 Git Bash is rewriting the container path. The script sets `MSYS_NO_PATHCONV=1` itself; set it yourself when you run `docker compose exec` by hand.
