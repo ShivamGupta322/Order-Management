@@ -107,7 +107,7 @@ Messages on `orders.retry` also carry `not_before` (Unix milliseconds). Messages
 | System of record | PostgreSQL through `epgsql`: orders and their status history |
 | Metrics | `prometheus.erl` (phase 9) |
 | Tests | EUnit, PropEr, Common Test, `meck`, Pact |
-| Infrastructure | Docker Compose: Kafka 3.9 (KRaft, no ZooKeeper), PostgreSQL 16, Prometheus |
+| Infrastructure | Docker Compose: Kafka 3.9 (KRaft, no ZooKeeper), PostgreSQL 16, Prometheus, Redpanda Console (Kafka web UI) |
 | Release | `relx` release in a slim Debian image; GitHub Actions CI |
 
 ---
@@ -139,6 +139,7 @@ That one command does everything:
 - creates the four topics (`kafka-init`, a one-shot service)
 - starts the app release (`orders`) once its dependencies are healthy
 - starts Prometheus
+- starts Redpanda Console, a web UI for Kafka
 
 The first build takes a few minutes. Then:
 
@@ -149,6 +150,7 @@ docker compose logs -f orders     # JSON log lines
 ```
 
 Prometheus is at <http://localhost:9090> (try the query `orders_processed_total`).
+The Kafka UI is at <http://localhost:8081>.
 
 ### Stopping
 
@@ -248,6 +250,14 @@ curl -X POST localhost:8080/orders -H 'content-type: application/json' \
 ```
 
 ### Watch messages arrive in Kafka
+
+The easiest way is the web UI at <http://localhost:8081>. It is Redpanda Console, the tool formerly called Kowl.
+
+- **Topics → `orders`** shows each message: key (the order ID), partition, offset and JSON value. Use **Start offset: Newest** and keep the tab open to see new orders arrive.
+- **`orders.retry`** has messages with `not_before` and `attempt`. **`orders.dlq`** has messages with `reason`.
+- **Consumer Groups → `order_consumers`** shows committed offsets and lag per partition. Lag going back to 0 means every order has been handled. `order_retry` is the retry consumer group.
+
+From the command line instead:
 
 ```bash
 # MSYS_NO_PATHCONV=1 stops Git Bash on Windows from rewriting /opt/... into a Windows path
@@ -441,7 +451,7 @@ docker compose run --rm --no-deps app escript scripts/load_test.escript 5000 50 
 │   ├── unit/                 EUnit and PropEr
 │   ├── ct/                   Common Test suites, including the end-to-end suite
 │   └── pact/                 contract suites and the Pact matcher
-├── docker-compose.yml        Kafka, PostgreSQL, topic init, the release, Prometheus, the dev container
+├── docker-compose.yml        Kafka, PostgreSQL, topic init, the release, Prometheus, Kafka UI, the dev container
 ├── Dockerfile                production image: relx release on debian:trixie-slim
 ├── Dockerfile.dev            dev image: Erlang 28 plus cmake (for brod's native extension)
 └── rebar.config
@@ -495,7 +505,7 @@ For the full specification, see [`docs/IMPLEMENTATION_GUIDE.md`](docs/IMPLEMENTA
 | 6. Idempotency | `idempotency_store`, gateway idempotency key | The same order sent twice is charged once | ✅ |
 | 7. Contract tests | Pact file and suites | Renaming a field on the producer fails the build | ✅ |
 | 8. PostgreSQL | `order_store_pg` behind the behaviour | Switching `store_impl` changes the store with no code change | ✅ |
-| 9. Metrics and release | Prometheus, JSON logs, `relx` release, CI | `docker compose up` starts everything and CI is green | ✅ (CI runs on the first push) |
+| 9. Metrics and release | Prometheus, JSON logs, `relx` release, CI | `docker compose up` starts everything and CI is green | ✅ |
 
 ---
 

@@ -55,7 +55,7 @@ A fault-tolerant, event-driven order processing backend in Erlang/OTP and Kafka.
 All `rebar3` commands run inside the `app` container (`brod`'s NIF does not build on Windows). Prefix each one with `docker compose run --rm app`.
 
 ```
-docker compose up -d                 # everything: Kafka, PostgreSQL, topics, the release, Prometheus
+docker compose up -d                 # everything: Kafka, PostgreSQL, topics, the release, Prometheus, Kafka UI (:8081)
 docker compose up -d kafka postgres kafka-init   # infrastructure only, for development
 docker compose stop orders           # before using the dev container or running e2e_SUITE
 docker compose run --rm --service-ports app rebar3 shell --sname order_processing   # run the app on :8080

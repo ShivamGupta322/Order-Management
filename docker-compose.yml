@@ -88,6 +88,18 @@ services:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports: ["9090:9090"]
 
+  # Kafka web UI (Redpanda Console, formerly Kowl): browse topics, messages
+  # by partition and offset, and consumer group lag. Host port 8081 because
+  # the app owns 8080.
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.8.0
+    environment:
+      KAFKA_BROKERS: kafka:19092
+    ports: ["8081:8080"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   # Development container: the project is bind-mounted and run with
   # `rebar3 shell`. It runs in Linux because brod's crc32cer NIF only builds
   # there. In the "dev" profile, so `docker compose up` does not start it.

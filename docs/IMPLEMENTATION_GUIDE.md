@@ -33,7 +33,7 @@ It is a backend-only project. There is no frontend: you drive it with `curl`, Po
 | System of record | PostgreSQL via `epgsql`, added in a later phase |
 | Metrics | `prometheus.erl`, optional Grafana |
 | Tests | EUnit, PropEr, Common Test, `meck`, Pact |
-| Infrastructure | Docker Compose: Kafka (KRaft), PostgreSQL, Prometheus |
+| Infrastructure | Docker Compose: Kafka (KRaft), PostgreSQL, Prometheus, Redpanda Console (Kafka web UI on :8081) |
 
 ## Architecture
 
